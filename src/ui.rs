@@ -67,7 +67,7 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         let message = if let Some(query) = app.search_query() {
             format!("No issue IDs match /{query}")
         } else {
-            "No issues found. Create one with `br create`.".to_string()
+            "No issues found. Create one with `bd create`.".to_string()
         };
         queue!(
             out,
@@ -223,7 +223,8 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
         Clear(ClearType::FromCursorDown)
     )?;
 
-    let footer = "j/k dependency · Enter open · Backspace back · Esc tree · q quit";
+    let footer =
+        "j/k dependency · Enter open · e edit description · Backspace back · Esc tree · q quit";
     queue!(
         out,
         MoveTo(0, height - 1),

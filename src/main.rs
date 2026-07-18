@@ -17,16 +17,16 @@ Usage: be [OPTIONS]
 
 Options:
       --db <PATH>   Use a specific beads database
-      --br <PATH>   Path to the br executable [env: BEADS_EXPLORER_BR]
+      --bd <PATH>   Path to the bd executable [env: BEADS_EXPLORER_BD]
   -h, --help        Print help
   -V, --version     Print version
 
 Tree:      j/k move · h/l fold · Tab toggle · Enter open · q/Esc quit
-Task view: j/k dependency · Enter open · Backspace back · Esc tree
+Task view: j/k dependency · Enter open · e edit description · Backspace back · Esc tree
 ";
 
 struct Options {
-    br: OsString,
+    bd: OsString,
     db: Option<PathBuf>,
 }
 
@@ -35,6 +35,15 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    fn activate(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if !self.active {
+            terminal::enable_raw_mode()?;
+            self.active = true;
+            execute!(out, EnterAlternateScreen, Hide)?;
+        }
+        Ok(())
+    }
+
     fn restore(&mut self, out: &mut impl Write) -> io::Result<()> {
         if self.active {
             execute!(out, LeaveAlternateScreen, Show)?;
@@ -61,7 +70,7 @@ impl Drop for TerminalGuard {
 
 fn parse_args() -> Result<Option<Options>, String> {
     let mut args = env::args_os().skip(1);
-    let mut br = env::var_os("BEADS_EXPLORER_BR").unwrap_or_else(|| OsString::from("br"));
+    let mut bd = env::var_os("BEADS_EXPLORER_BD").unwrap_or_else(|| OsString::from("bd"));
     let mut db = None;
     while let Some(argument) = args.next() {
         match argument.to_string_lossy().as_ref() {
@@ -73,10 +82,10 @@ fn parse_args() -> Result<Option<Options>, String> {
                 println!("be {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
-            "--br" => {
-                br = args
+            "--bd" => {
+                bd = args
                     .next()
-                    .ok_or_else(|| "--br requires a path".to_string())?;
+                    .ok_or_else(|| "--bd requires a path".to_string())?;
             }
             "--db" => {
                 db = Some(PathBuf::from(
@@ -87,11 +96,11 @@ fn parse_args() -> Result<Option<Options>, String> {
             unknown => return Err(format!("unknown option: {unknown}\n\n{HELP}")),
         }
     }
-    Ok(Some(Options { br, db }))
+    Ok(Some(Options { bd, db }))
 }
 
 fn run(options: Options) -> io::Result<()> {
-    let graph = model::load(&options.br, options.db.as_deref())?;
+    let graph = model::load(&options.bd, options.db.as_deref())?;
     let mut app = App::new(graph);
 
     let output: Box<dyn Write> = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
@@ -107,11 +116,24 @@ fn run(options: Options) -> io::Result<()> {
         let (width, height) = terminal::size()?;
         ui::draw(&mut app, &mut out, width, height)?;
         match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if app.handle_key(key) == Action::Quit {
-                    break;
+            Event::Key(key) if key.kind == KeyEventKind::Press => match app.handle_key(key) {
+                Action::Quit => break,
+                Action::EditDescription => {
+                    let Some(issue_id) = app.current_detail_issue().map(|issue| issue.id.clone())
+                    else {
+                        continue;
+                    };
+                    guard.restore(&mut out)?;
+                    let edit_result =
+                        model::edit_description(&options.bd, options.db.as_deref(), &issue_id)
+                            .and_then(|_| {
+                                model::load_issue(&options.bd, options.db.as_deref(), &issue_id)
+                            });
+                    guard.activate(&mut out)?;
+                    app.graph.replace_issue(edit_result?);
                 }
-            }
+                Action::None => {}
+            },
             _ => {}
         }
     }

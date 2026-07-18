@@ -8,8 +8,12 @@ use std::process::Command;
 
 const SHOW_CHUNK_SIZE: usize = 128;
 
+// `bd show` hydrates dependencies into issue summaries (`id`, `title`, ...),
+// while `bd list` emits raw edge records (`depends_on_id`, `type`, ...). The
+// aliases let one shape cover both.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Dependency {
+    #[serde(alias = "depends_on_id")]
     pub id: String,
     #[serde(default)]
     pub title: String,
@@ -17,7 +21,7 @@ pub struct Dependency {
     pub status: String,
     #[serde(default)]
     pub priority: i32,
-    #[serde(default)]
+    #[serde(default, alias = "type")]
     pub dependency_type: String,
 }
 
@@ -131,15 +135,19 @@ impl IssueGraph {
     pub fn len(&self) -> usize {
         self.order.len()
     }
+
+    pub fn replace_issue(&mut self, issue: Issue) {
+        self.issues.insert(issue.id.clone(), issue);
+    }
 }
 
-pub fn load(br: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
-    let mut list_args = vec!["list", "--status", "open", "--json", "--no-color"];
+pub fn load(bd: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
+    let mut list_args = vec!["list", "--status", "open", "--json"];
     let db_string = db.map(|path| path.to_string_lossy().into_owned());
     if let Some(path) = db_string.as_deref() {
         list_args.extend(["--db", path]);
     }
-    let list_value = run_br_json(br, &list_args)?;
+    let list_value = run_bd_json(bd, &list_args)?;
     let summaries = parse_issue_collection(list_value)?;
     if summaries.is_empty() {
         return Ok(IssueGraph::default());
@@ -153,14 +161,14 @@ pub fn load(br: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
     let mut detailed = Vec::with_capacity(summaries.len());
 
     for chunk in summaries.chunks(SHOW_CHUNK_SIZE) {
-        let mut args = Vec::with_capacity(chunk.len() + 6);
+        let mut args = Vec::with_capacity(chunk.len() + 5);
         args.push("show");
         args.extend(chunk.iter().map(|issue| issue.id.as_str()));
-        args.extend(["--json", "--no-color"]);
+        args.push("--json");
         if let Some(path) = db_string.as_deref() {
             args.extend(["--db", path]);
         }
-        detailed.extend(parse_issue_collection(run_br_json(br, &args)?)?);
+        detailed.extend(parse_issue_collection(run_bd_json(bd, &args)?)?);
     }
 
     for issue in &mut detailed {
@@ -170,7 +178,7 @@ pub fn load(br: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
     }
     detailed.extend(summary_map.into_values());
 
-    // Restore the stable ordering returned by `br list` after merging chunks.
+    // Restore the stable ordering returned by `bd list` after merging chunks.
     let positions: HashMap<&str, usize> = summaries
         .iter()
         .enumerate()
@@ -184,6 +192,46 @@ pub fn load(br: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
     });
 
     Ok(IssueGraph::new(detailed))
+}
+
+pub fn edit_description(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
+    let mut command = Command::new(bd);
+    command.args(["edit", issue_id, "--description"]);
+    if let Some(path) = db {
+        command.arg("--db").arg(path);
+    }
+
+    let status = command.status().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not run {}: {error}", bd.to_string_lossy()),
+        )
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{} edit failed: {status}",
+            bd.to_string_lossy()
+        )))
+    }
+}
+
+pub fn load_issue(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<Issue> {
+    let db_string = db.map(|path| path.to_string_lossy().into_owned());
+    let mut args = vec!["show", issue_id, "--json"];
+    if let Some(path) = db_string.as_deref() {
+        args.extend(["--db", path]);
+    }
+    parse_issue_collection(run_bd_json(bd, &args)?)?
+        .into_iter()
+        .find(|issue| issue.id == issue_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} show returned no issue {issue_id}", bd.to_string_lossy()),
+            )
+        })
 }
 
 fn fill_missing_fields(issue: &mut Issue, summary: Issue) {
@@ -207,11 +255,11 @@ fn fill_missing_fields(issue: &mut Issue, summary: Issue) {
     }
 }
 
-fn run_br_json(br: &OsStr, args: &[&str]) -> io::Result<Value> {
-    let output = Command::new(br).args(args).output().map_err(|error| {
+fn run_bd_json(bd: &OsStr, args: &[&str]) -> io::Result<Value> {
+    let output = Command::new(bd).args(args).output().map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("could not run {}: {error}", br.to_string_lossy()),
+            format!("could not run {}: {error}", bd.to_string_lossy()),
         )
     })?;
     if !output.status.success() {
@@ -224,7 +272,7 @@ fn run_br_json(br: &OsStr, args: &[&str]) -> io::Result<Value> {
         };
         return Err(io::Error::other(format!(
             "{} {} failed: {}",
-            br.to_string_lossy(),
+            bd.to_string_lossy(),
             args.first().copied().unwrap_or(""),
             if message.is_empty() {
                 output.status.to_string()
@@ -238,7 +286,7 @@ fn run_br_json(br: &OsStr, args: &[&str]) -> io::Result<Value> {
             io::ErrorKind::InvalidData,
             format!(
                 "{} returned invalid JSON for {}: {error}",
-                br.to_string_lossy(),
+                bd.to_string_lossy(),
                 args.first().copied().unwrap_or("command")
             ),
         )
@@ -258,7 +306,7 @@ fn parse_issue_collection(value: Value) -> io::Result<Vec<Issue>> {
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "unexpected issue JSON shape from br",
+                "unexpected issue JSON shape from bd",
             ))
         }
     };
@@ -308,10 +356,40 @@ mod tests {
     }
 
     #[test]
+    fn replacing_issue_refreshes_its_description() {
+        let mut graph = IssueGraph::new(vec![issue("a", &[])]);
+        let mut refreshed = issue("a", &[]);
+        refreshed.description = "Edited description".to_string();
+
+        graph.replace_issue(refreshed);
+
+        assert_eq!(graph.issue("a").unwrap().description, "Edited description");
+        assert!(graph.is_listed("a"));
+    }
+
+    #[test]
     fn parses_list_and_show_shapes() {
         let wrapped = serde_json::json!({"issues": [{"id": "a", "title": "A"}]});
         let array = serde_json::json!([{"id": "b", "title": "B"}]);
         assert_eq!(parse_issue_collection(wrapped).unwrap()[0].id, "a");
         assert_eq!(parse_issue_collection(array).unwrap()[0].id, "b");
+    }
+
+    #[test]
+    fn parses_hydrated_and_edge_dependency_shapes() {
+        let value = serde_json::json!([{
+            "id": "a",
+            "dependencies": [
+                {"id": "b", "title": "B", "status": "open", "priority": 1, "dependency_type": "blocks"},
+                {"issue_id": "a", "depends_on_id": "c", "type": "parent-child", "metadata": "{}"},
+            ],
+        }]);
+        let deps = parse_issue_collection(value).unwrap()[0]
+            .dependencies
+            .clone();
+        assert_eq!(deps[0].id, "b");
+        assert_eq!(deps[0].dependency_type, "blocks");
+        assert_eq!(deps[1].id, "c");
+        assert_eq!(deps[1].dependency_type, "parent-child");
     }
 }

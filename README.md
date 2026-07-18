@@ -1,6 +1,6 @@
 # beads explorer
 
-`be` is a dead simple, fast terminal explorer for [beads_rust](https://github.com/Dicklesworthstone/beads_rust) issue graphs. It asks the installed `br` command for JSON data, so it uses the same workspace discovery and database semantics as the main beads CLI.
+`be` is a dead simple, fast terminal explorer for [beads](https://github.com/gastownhall/beads) issue graphs. It asks the installed `bd` command for JSON data, so it uses the same workspace discovery and database semantics as the main beads CLI.
 
 https://github.com/user-attachments/assets/0b5e8a19-5941-4f8e-885a-9a6cc8f0e3da
 
@@ -14,7 +14,7 @@ The script builds `be` with cargo (cloning the repo to a temp dir first, or in p
 
 If you'd rather skip the script: `cargo install --git https://github.com/finallyblueskies/beads-explorer` installs to `~/.cargo/bin` (remove with `cargo uninstall beads-explorer`).
 
-Then run `be` anywhere that `br list` works. The tree shows issues whose status is `open`; non-open dependencies remain available when navigating through Task View. Use `be --db path/to/beads.db` to select a database explicitly.
+Then run `be` anywhere that `bd list` works. The tree shows issues whose status is `open`; non-open dependencies remain available when navigating through Task View. Use `be --db path/to/.beads` to select a database explicitly, or `--bd path/to/bd` (env: `BEADS_EXPLORER_BD`) to point at a specific `bd` executable.
 
 ## Navigation
 
@@ -24,6 +24,7 @@ Then run `be` anywhere that `br list` works. The tree shows issues whose status 
 | `h` / `l`, Left / Right | Fold / expand | — |
 | `Tab` | Toggle fold | — |
 | `Enter` | Open task | Open dependency |
+| `e` | — | Edit description in `$EDITOR` |
 | `/` | Fuzzy go-to by issue ID | — |
 | `Backspace` | — | Previous task/tree |
 | `Esc` | Quit | Return to tree |
@@ -33,4 +34,4 @@ While go-to is open, type any part of an issue ID; matching is case-insensitive 
 
 ## Planned improvements
 
-- Quick edit issue status, description, title from task view
+- Quick edit issue status and title from task view

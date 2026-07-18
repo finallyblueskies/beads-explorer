@@ -27,6 +27,7 @@ pub enum Screen {
 pub enum Action {
     None,
     Quit,
+    EditDescription,
 }
 
 pub struct App {
@@ -213,6 +214,9 @@ impl App {
                 }
             }
             KeyCode::Enter => self.open_selected_dependency(),
+            KeyCode::Char('e') if self.current_detail_issue().is_some() => {
+                return Action::EditDescription;
+            }
             KeyCode::Backspace => {
                 self.history.pop();
             }
@@ -505,6 +509,18 @@ mod tests {
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen(), Screen::Tree);
+    }
+
+    #[test]
+    fn e_in_task_view_requests_description_edit() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Action::EditDescription
+        );
+        assert_eq!(app.current_detail_issue().unwrap().id, "a");
     }
 
     #[test]
