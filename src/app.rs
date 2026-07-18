@@ -100,13 +100,7 @@ impl App {
     }
 
     pub fn row_has_children(&self, row: &TreeRow) -> bool {
-        !row.cycle
-            && self.graph.issue(&row.issue_id).is_some_and(|issue| {
-                issue
-                    .dependencies
-                    .iter()
-                    .any(|dependency| self.graph.is_listed(&dependency.id))
-            })
+        !row.cycle && !self.graph.tree_children(&row.issue_id).is_empty()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -375,22 +369,18 @@ impl App {
             if !expanded.contains(path) {
                 return;
             }
-            let Some(issue) = path.last().and_then(|id| graph.issue(id)) else {
+            let Some(issue_id) = path.last() else {
                 return;
             };
-            let dependencies: Vec<_> = issue
-                .dependencies
-                .iter()
-                .filter(|dependency| graph.is_listed(&dependency.id))
-                .collect();
-            let count = dependencies.len();
-            for (index, dependency) in dependencies.into_iter().enumerate() {
+            let children = graph.tree_children(issue_id);
+            let count = children.len();
+            for (index, child_id) in children.iter().enumerate() {
                 let last = index + 1 == count;
-                let cycle = path.iter().any(|id| id == &dependency.id);
+                let cycle = path.iter().any(|id| id == child_id);
                 let mut child_path = path.to_vec();
-                child_path.push(dependency.id.clone());
+                child_path.push(child_id.clone());
                 rows.push(TreeRow {
-                    issue_id: dependency.id.clone(),
+                    issue_id: child_id.clone(),
                     path: child_path.clone(),
                     prefix: format!("{prefix}{}", if last { "└── " } else { "├── " }),
                     cycle,
@@ -497,6 +487,31 @@ mod tests {
         assert_eq!(app.cursor, 1);
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn parent_child_edges_expand_from_parent_to_child() {
+        let child = Issue {
+            id: "hmb2".into(),
+            dependencies: vec![Dependency {
+                id: "8gda".into(),
+                dependency_type: "parent-child".into(),
+                ..Dependency::default()
+            }],
+            ..Issue::default()
+        };
+        let parent = Issue {
+            id: "8gda".into(),
+            ..Issue::default()
+        };
+        let mut app = App::new(IssueGraph::new(vec![child, parent], vec![]));
+
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].issue_id, "8gda");
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.rows.len(), 2);
+        assert_eq!(app.rows[1].issue_id, "hmb2");
     }
 
     #[test]

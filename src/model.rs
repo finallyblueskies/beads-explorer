@@ -49,6 +49,7 @@ pub struct IssueGraph {
     issues: HashMap<String, Issue>,
     order: Vec<String>,
     listed: HashSet<String>,
+    tree_children: HashMap<String, Vec<String>>,
     roots: Vec<String>,
 }
 
@@ -95,13 +96,32 @@ impl IssueGraph {
             map.entry(issue.id.clone()).or_insert(issue);
         }
 
-        // Only listed issues shape the tree, so context issues' edges must not
-        // steal root status from a listed issue.
-        let targets: HashSet<&str> = order
-            .iter()
-            .filter_map(|id| map.get(id))
-            .flat_map(|issue| issue.dependencies.iter().map(|dep| dep.id.as_str()))
-            .collect();
+        // `bd` stores parent-child on the child as a dependency on its parent.
+        // Reverse that relationship for the tree while leaving other dependency
+        // types pointing from an issue to its prerequisite. Only listed issues
+        // shape the tree, so edges to or from context issues are omitted.
+        let mut tree_children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut targets = HashSet::new();
+        for issue_id in &order {
+            let Some(issue) = map.get(issue_id) else {
+                continue;
+            };
+            for dependency in &issue.dependencies {
+                if !listed.contains(&dependency.id) {
+                    continue;
+                }
+                let (parent, child) = if dependency.dependency_type == "parent-child" {
+                    (dependency.id.clone(), issue.id.clone())
+                } else {
+                    (issue.id.clone(), dependency.id.clone())
+                };
+                let children = tree_children.entry(parent).or_default();
+                if !children.contains(&child) {
+                    children.push(child.clone());
+                }
+                targets.insert(child);
+            }
+        }
         let mut roots: Vec<String> = order
             .iter()
             .filter(|id| !targets.contains(id.as_str()))
@@ -118,6 +138,7 @@ impl IssueGraph {
             issues: map,
             order,
             listed,
+            tree_children,
             roots,
         }
     }
@@ -132,6 +153,10 @@ impl IssueGraph {
 
     pub fn is_listed(&self, id: &str) -> bool {
         self.listed.contains(id)
+    }
+
+    pub fn tree_children(&self, id: &str) -> &[String] {
+        self.tree_children.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub fn is_empty(&self) -> bool {
@@ -300,6 +325,17 @@ mod tests {
             vec![],
         );
         assert_eq!(graph.roots(), &["a", "c"]);
+    }
+
+    #[test]
+    fn parent_child_edges_are_reversed_for_the_tree() {
+        let mut child = issue("hmb2", &["8gda"]);
+        child.dependencies[0].dependency_type = "parent-child".to_string();
+        let graph = IssueGraph::new(vec![child, issue("8gda", &[])], vec![]);
+
+        assert_eq!(graph.roots(), &["8gda"]);
+        assert_eq!(graph.tree_children("8gda"), &["hmb2"]);
+        assert!(graph.tree_children("hmb2").is_empty());
     }
 
     #[test]
