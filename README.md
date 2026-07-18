@@ -5,10 +5,10 @@
 ## Install
 
 ```sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/finallyblueskies/beads-explorer/main/install.sh | sh
 ```
 
-This builds a release binary and installs `be` into `~/.local/bin` (override with `BIN_DIR=/some/path ./install.sh`). Remove it later with `./uninstall.sh`. If you prefer cargo, `cargo install --path .` works too.
+The script builds `be` with cargo (cloning the repo to a temp dir first, or in place when run from a checkout) and installs it into `~/.local/bin` — override with `curl ... | BIN_DIR=/some/path sh`. Uninstall the same way with `uninstall.sh`, or use `cargo install --git https://github.com/finallyblueskies/beads-explorer` if you'd rather skip the script.
 
 Then run `be` anywhere that `br list` works. The tree shows issues whose status is `open`; non-open dependencies remain available when navigating through Task View. Use `be --db path/to/beads.db` to select a database explicitly.
 
