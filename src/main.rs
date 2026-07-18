@@ -23,7 +23,7 @@ Options:
 
 Tree:      j/k move · h/l fold · Tab toggle · Enter open · q/Esc quit
 Task view: j/k dependency · Enter open · e edit description · Backspace back · Esc tree
-           et edit title
+           et edit title · x close issue (with confirmation)
 ";
 
 struct Options {
@@ -134,6 +134,14 @@ fn run(options: Options) -> io::Result<()> {
 
         match action {
             Action::Quit => break,
+            Action::CloseIssue => {
+                let Some(issue_id) = app.current_detail_issue().map(|issue| issue.id.clone())
+                else {
+                    continue;
+                };
+                model::close_issue(&options.bd, options.db.as_deref(), &issue_id)?;
+                app = App::new(model::load(&options.bd, options.db.as_deref())?);
+            }
             action @ (Action::EditDescription | Action::EditTitle) => {
                 let Some(issue_id) = app.current_detail_issue().map(|issue| issue.id.clone())
                 else {

@@ -25,6 +25,7 @@ Then run `be` anywhere that `bd list` works. The tree shows issues whose status 
 | `Tab` | Toggle fold | — |
 | `Enter` | Open task | Open dependency |
 | `e` | — | Edit description in `$EDITOR` |
+| `x`, then `y` | — | Close issue after confirmation |
 | `/` | Fuzzy go-to by issue ID | — |
 | `Backspace` | — | Previous task/tree |
 | `Esc` | Quit | Return to tree |

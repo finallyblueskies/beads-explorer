@@ -198,6 +198,32 @@ pub fn edit_title(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<(
     edit_field(bd, db, issue_id, "--title")
 }
 
+pub fn close_issue(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
+    let mut command = Command::new(bd);
+    command.args(["close", issue_id]);
+    if let Some(path) = db {
+        command.arg("--db").arg(path);
+    }
+
+    let output = command.output().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not run {}: {error}", bd.to_string_lossy()),
+        )
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr);
+        let message = message.trim();
+        Err(io::Error::other(if message.is_empty() {
+            format!("{} close failed: {}", bd.to_string_lossy(), output.status)
+        } else {
+            format!("{} close failed: {message}", bd.to_string_lossy())
+        }))
+    }
+}
+
 fn edit_field(bd: &OsStr, db: Option<&Path>, issue_id: &str, field: &str) -> io::Result<()> {
     let mut command = Command::new(bd);
     command.args(["edit", issue_id, field]);

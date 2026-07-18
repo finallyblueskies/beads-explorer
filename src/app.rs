@@ -30,6 +30,7 @@ pub enum Screen {
 pub enum Action {
     None,
     Quit,
+    CloseIssue,
     EditDescription,
     EditTitle,
 }
@@ -46,6 +47,7 @@ pub struct App {
     tree_rows: Vec<TreeRow>,
     expanded: HashSet<Vec<String>>,
     history: Vec<DetailFrame>,
+    confirming_close: bool,
     edit_key_started: Option<Instant>,
 }
 
@@ -63,6 +65,7 @@ impl App {
             tree_rows: Vec::new(),
             expanded: HashSet::new(),
             history: Vec::new(),
+            confirming_close: false,
             edit_key_started: None,
         };
         app.rebuild_rows();
@@ -101,6 +104,15 @@ impl App {
         self.history.last_mut()
     }
 
+    pub fn is_confirming_close(&self) -> bool {
+        self.confirming_close
+    }
+
+    pub fn can_close_current_issue(&self) -> bool {
+        self.current_detail_issue()
+            .is_some_and(|issue| self.graph.is_listed(&issue.id))
+    }
+
     pub fn row_is_expanded(&self, row: &TreeRow) -> bool {
         self.expanded.contains(&row.path)
     }
@@ -111,6 +123,7 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.confirming_close = false;
             self.edit_key_started = None;
             return Action::Quit;
         }
@@ -210,6 +223,20 @@ impl App {
     }
 
     fn handle_detail_key(&mut self, key: KeyEvent) -> Action {
+        if self.confirming_close {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirming_close = false;
+                    return Action::CloseIssue;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirming_close = false;
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+
         if let Some(started) = self.edit_key_started.take() {
             let plain_t = key.code == KeyCode::Char('t')
                 && !key
@@ -242,6 +269,9 @@ impl App {
             KeyCode::Enter => self.open_selected_dependency(),
             KeyCode::Char('e') if self.current_detail_issue().is_some() => {
                 self.edit_key_started = Some(Instant::now());
+            }
+            KeyCode::Char('x') if self.can_close_current_issue() => {
+                self.confirming_close = true;
             }
             KeyCode::Backspace => {
                 self.history.pop();
@@ -579,6 +609,55 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
         assert_eq!(app.handle_key(key(KeyCode::Char('t'))), Action::EditTitle);
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
+    }
+
+    #[test]
+    fn x_in_task_view_requires_confirmation_before_closing() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Action::None);
+        assert!(app.is_confirming_close());
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Action::CloseIssue);
+        assert!(!app.is_confirming_close());
+        assert_eq!(app.current_detail_issue().unwrap().id, "a");
+    }
+
+    #[test]
+    fn close_confirmation_can_be_cancelled() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert!(!app.is_confirming_close());
+        assert_eq!(app.screen(), Screen::Detail);
+    }
+
+    #[test]
+    fn context_issues_cannot_be_closed_again() {
+        let mut app = App::new(IssueGraph::new(
+            vec![Issue {
+                id: "open".into(),
+                dependencies: vec![Dependency {
+                    id: "closed".into(),
+                    status: "closed".into(),
+                    ..Dependency::default()
+                }],
+                ..Issue::default()
+            }],
+            vec![Issue {
+                id: "closed".into(),
+                status: "closed".into(),
+                ..Issue::default()
+            }],
+        ));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(!app.can_close_current_issue());
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Action::None);
+        assert!(!app.is_confirming_close());
     }
 
     #[test]

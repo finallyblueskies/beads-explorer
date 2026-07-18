@@ -223,15 +223,32 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
         Clear(ClearType::FromCursorDown)
     )?;
 
-    let footer =
-        "j/k dependency · Enter open · e description · et title · Backspace back · Esc tree · q quit";
+    let footer = if app.is_confirming_close() {
+        format!("Close issue {}? y confirm · n/Esc cancel", issue.id)
+    } else if app.can_close_current_issue() {
+        "j/k dependency · Enter open · e description · et title · x close · Backspace back · Esc tree · q quit"
+            .to_string()
+    } else {
+        "j/k dependency · Enter open · e description · et title · Backspace back · Esc tree · q quit"
+            .to_string()
+    };
     queue!(
         out,
         MoveTo(0, height - 1),
         Clear(ClearType::CurrentLine),
-        SetAttribute(Attribute::Dim),
-        Print(truncate(footer, width)),
-        SetAttribute(Attribute::Reset)
+        SetForegroundColor(if app.is_confirming_close() {
+            Color::Yellow
+        } else {
+            Color::Reset
+        }),
+        SetAttribute(if app.is_confirming_close() {
+            Attribute::Bold
+        } else {
+            Attribute::Dim
+        }),
+        Print(truncate(&footer, width)),
+        ResetColor,
+        SetAttribute(Attribute::Reset),
     )?;
     Ok(())
 }
