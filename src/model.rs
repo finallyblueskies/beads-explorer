@@ -6,8 +6,6 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
-const SHOW_CHUNK_SIZE: usize = 128;
-
 // `bd show` hydrates dependencies into issue summaries (`id`, `title`, ...),
 // while `bd list` emits raw edge records (`depends_on_id`, `type`, ...). The
 // aliases let one shape cover both.
@@ -55,16 +53,21 @@ pub struct IssueGraph {
 }
 
 impl IssueGraph {
-    pub fn new(issues: Vec<Issue>) -> Self {
-        let mut order = Vec::with_capacity(issues.len());
-        let mut map = HashMap::with_capacity(issues.len());
-        for issue in issues {
+    /// `listed` issues form the tree; `context` issues (e.g. closed ones) only
+    /// hydrate dependency targets reached through Task View.
+    pub fn new(listed_issues: Vec<Issue>, context: Vec<Issue>) -> Self {
+        let mut order = Vec::with_capacity(listed_issues.len());
+        let mut map = HashMap::with_capacity(listed_issues.len() + context.len());
+        for issue in listed_issues {
             if !map.contains_key(&issue.id) {
                 order.push(issue.id.clone());
             }
             map.insert(issue.id.clone(), issue);
         }
-        let listed = order.iter().cloned().collect();
+        let listed: HashSet<String> = order.iter().cloned().collect();
+        for issue in context {
+            map.entry(issue.id.clone()).or_insert(issue);
+        }
 
         // A dependency can point to a deleted or externally sourced issue. Keep a
         // navigable placeholder rather than silently dropping that graph edge.
@@ -92,8 +95,11 @@ impl IssueGraph {
             map.entry(issue.id.clone()).or_insert(issue);
         }
 
-        let targets: HashSet<&str> = map
-            .values()
+        // Only listed issues shape the tree, so context issues' edges must not
+        // steal root status from a listed issue.
+        let targets: HashSet<&str> = order
+            .iter()
+            .filter_map(|id| map.get(id))
             .flat_map(|issue| issue.dependencies.iter().map(|dep| dep.id.as_str()))
             .collect();
         let mut roots: Vec<String> = order
@@ -142,56 +148,21 @@ impl IssueGraph {
 }
 
 pub fn load(bd: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
-    let mut list_args = vec!["list", "--status", "open", "--json"];
+    // One `bd list --all` call: per-ID `bd show` resolution costs ~250ms per
+    // issue, so hydrating dependency targets from the same payload instead
+    // keeps startup at a single fast query.
+    let mut args = vec!["list", "--all", "--json"];
     let db_string = db.map(|path| path.to_string_lossy().into_owned());
     if let Some(path) = db_string.as_deref() {
-        list_args.extend(["--db", path]);
+        args.extend(["--db", path]);
     }
-    let list_value = run_bd_json(bd, &list_args)?;
-    let summaries = parse_issue_collection(list_value)?;
-    if summaries.is_empty() {
+    let issues = parse_issue_collection(run_bd_json(bd, &args)?)?;
+    let (listed, context): (Vec<Issue>, Vec<Issue>) =
+        issues.into_iter().partition(|issue| issue.status == "open");
+    if listed.is_empty() {
         return Ok(IssueGraph::default());
     }
-
-    let mut summary_map: HashMap<String, Issue> = summaries
-        .iter()
-        .cloned()
-        .map(|issue| (issue.id.clone(), issue))
-        .collect();
-    let mut detailed = Vec::with_capacity(summaries.len());
-
-    for chunk in summaries.chunks(SHOW_CHUNK_SIZE) {
-        let mut args = Vec::with_capacity(chunk.len() + 5);
-        args.push("show");
-        args.extend(chunk.iter().map(|issue| issue.id.as_str()));
-        args.push("--json");
-        if let Some(path) = db_string.as_deref() {
-            args.extend(["--db", path]);
-        }
-        detailed.extend(parse_issue_collection(run_bd_json(bd, &args)?)?);
-    }
-
-    for issue in &mut detailed {
-        if let Some(summary) = summary_map.remove(&issue.id) {
-            fill_missing_fields(issue, summary);
-        }
-    }
-    detailed.extend(summary_map.into_values());
-
-    // Restore the stable ordering returned by `bd list` after merging chunks.
-    let positions: HashMap<&str, usize> = summaries
-        .iter()
-        .enumerate()
-        .map(|(index, issue)| (issue.id.as_str(), index))
-        .collect();
-    detailed.sort_by_key(|issue| {
-        positions
-            .get(issue.id.as_str())
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
-
-    Ok(IssueGraph::new(detailed))
+    Ok(IssueGraph::new(listed, context))
 }
 
 pub fn edit_description(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
@@ -232,27 +203,6 @@ pub fn load_issue(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<I
                 format!("{} show returned no issue {issue_id}", bd.to_string_lossy()),
             )
         })
-}
-
-fn fill_missing_fields(issue: &mut Issue, summary: Issue) {
-    if issue.title.is_empty() {
-        issue.title = summary.title;
-    }
-    if issue.description.is_empty() {
-        issue.description = summary.description;
-    }
-    if issue.status.is_empty() {
-        issue.status = summary.status;
-    }
-    if issue.issue_type.is_empty() {
-        issue.issue_type = summary.issue_type;
-    }
-    if issue.created_at.is_empty() {
-        issue.created_at = summary.created_at;
-    }
-    if issue.updated_at.is_empty() {
-        issue.updated_at = summary.updated_at;
-    }
 }
 
 fn run_bd_json(bd: &OsStr, args: &[&str]) -> io::Result<Value> {
@@ -345,19 +295,35 @@ mod tests {
 
     #[test]
     fn roots_are_issues_not_targeted_by_another_issue() {
-        let graph = IssueGraph::new(vec![issue("a", &["b"]), issue("b", &[]), issue("c", &[])]);
+        let graph = IssueGraph::new(
+            vec![issue("a", &["b"]), issue("b", &[]), issue("c", &[])],
+            vec![],
+        );
         assert_eq!(graph.roots(), &["a", "c"]);
     }
 
     #[test]
     fn cycles_remain_visible() {
-        let graph = IssueGraph::new(vec![issue("a", &["b"]), issue("b", &["a"])]);
+        let graph = IssueGraph::new(vec![issue("a", &["b"]), issue("b", &["a"])], vec![]);
         assert_eq!(graph.roots(), &["a", "b"]);
     }
 
     #[test]
+    fn context_issues_hydrate_dependencies_without_joining_the_tree() {
+        let mut closed = issue("z", &["a"]);
+        closed.status = "closed".to_string();
+        let graph = IssueGraph::new(vec![issue("a", &["z"])], vec![closed]);
+
+        assert_eq!(graph.issue("z").unwrap().title, "z");
+        assert_eq!(graph.issue("z").unwrap().status, "closed");
+        assert!(!graph.is_listed("z"));
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph.roots(), &["a"]);
+    }
+
+    #[test]
     fn replacing_issue_refreshes_its_description() {
-        let mut graph = IssueGraph::new(vec![issue("a", &[])]);
+        let mut graph = IssueGraph::new(vec![issue("a", &[])], vec![]);
         let mut refreshed = issue("a", &[]);
         refreshed.description = "Edited description".to_string();
 

@@ -457,23 +457,26 @@ mod tests {
     use crate::model::{Dependency, Issue};
 
     fn graph() -> IssueGraph {
-        IssueGraph::new(vec![
-            Issue {
-                id: "a".into(),
-                title: "A".into(),
-                dependencies: vec![Dependency {
+        IssueGraph::new(
+            vec![
+                Issue {
+                    id: "a".into(),
+                    title: "A".into(),
+                    dependencies: vec![Dependency {
+                        id: "b".into(),
+                        title: "B".into(),
+                        ..Dependency::default()
+                    }],
+                    ..Issue::default()
+                },
+                Issue {
                     id: "b".into(),
                     title: "B".into(),
-                    ..Dependency::default()
-                }],
-                ..Issue::default()
-            },
-            Issue {
-                id: "b".into(),
-                title: "B".into(),
-                ..Issue::default()
-            },
-        ])
+                    ..Issue::default()
+                },
+            ],
+            vec![],
+        )
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -525,17 +528,20 @@ mod tests {
 
     #[test]
     fn dependencies_outside_the_filtered_list_stay_out_of_the_tree() {
-        let mut app = App::new(IssueGraph::new(vec![Issue {
-            id: "open".into(),
-            title: "Open".into(),
-            dependencies: vec![Dependency {
-                id: "closed".into(),
-                title: "Closed".into(),
-                status: "closed".into(),
-                ..Dependency::default()
+        let mut app = App::new(IssueGraph::new(
+            vec![Issue {
+                id: "open".into(),
+                title: "Open".into(),
+                dependencies: vec![Dependency {
+                    id: "closed".into(),
+                    title: "Closed".into(),
+                    status: "closed".into(),
+                    ..Dependency::default()
+                }],
+                ..Issue::default()
             }],
-            ..Issue::default()
-        }]));
+            vec![],
+        ));
 
         app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.rows.len(), 1);
@@ -546,16 +552,19 @@ mod tests {
 
     #[test]
     fn slash_fuzzy_filters_visible_ids_and_enter_opens_match() {
-        let mut app = App::new(IssueGraph::new(vec![
-            Issue {
-                id: "issue-alpha".into(),
-                ..Issue::default()
-            },
-            Issue {
-                id: "issue-jbeta".into(),
-                ..Issue::default()
-            },
-        ]));
+        let mut app = App::new(IssueGraph::new(
+            vec![
+                Issue {
+                    id: "issue-alpha".into(),
+                    ..Issue::default()
+                },
+                Issue {
+                    id: "issue-jbeta".into(),
+                    ..Issue::default()
+                },
+            ],
+            vec![],
+        ));
 
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(key(KeyCode::Char('j')));
