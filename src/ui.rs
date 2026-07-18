@@ -224,7 +224,7 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
     )?;
 
     let footer =
-        "j/k dependency · Enter open · e edit description · Backspace back · Esc tree · q quit";
+        "j/k dependency · Enter open · e description · et title · Backspace back · Esc tree · q quit";
     queue!(
         out,
         MoveTo(0, height - 1),

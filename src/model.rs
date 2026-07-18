@@ -191,8 +191,16 @@ pub fn load(bd: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
 }
 
 pub fn edit_description(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
+    edit_field(bd, db, issue_id, "--description")
+}
+
+pub fn edit_title(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
+    edit_field(bd, db, issue_id, "--title")
+}
+
+fn edit_field(bd: &OsStr, db: Option<&Path>, issue_id: &str, field: &str) -> io::Result<()> {
     let mut command = Command::new(bd);
-    command.args(["edit", issue_id, "--description"]);
+    command.args(["edit", issue_id, field]);
     if let Some(path) = db {
         command.arg("--db").arg(path);
     }

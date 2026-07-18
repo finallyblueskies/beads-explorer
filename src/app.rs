@@ -1,6 +1,9 @@
 use crate::model::{Dependency, Issue, IssueGraph};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
+
+const EDIT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeRow {
@@ -28,6 +31,7 @@ pub enum Action {
     None,
     Quit,
     EditDescription,
+    EditTitle,
 }
 
 pub struct App {
@@ -42,6 +46,7 @@ pub struct App {
     tree_rows: Vec<TreeRow>,
     expanded: HashSet<Vec<String>>,
     history: Vec<DetailFrame>,
+    edit_key_started: Option<Instant>,
 }
 
 impl App {
@@ -58,6 +63,7 @@ impl App {
             tree_rows: Vec::new(),
             expanded: HashSet::new(),
             history: Vec::new(),
+            edit_key_started: None,
         };
         app.rebuild_rows();
         app
@@ -105,11 +111,25 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.edit_key_started = None;
             return Action::Quit;
         }
         match self.screen() {
             Screen::Tree => self.handle_tree_key(key),
             Screen::Detail => self.handle_detail_key(key),
+        }
+    }
+
+    pub fn pending_key_timeout(&self) -> Option<Duration> {
+        self.edit_key_started
+            .map(|started| EDIT_SEQUENCE_TIMEOUT.saturating_sub(started.elapsed()))
+    }
+
+    pub fn flush_pending_key(&mut self) -> Action {
+        if self.edit_key_started.take().is_some() {
+            Action::EditDescription
+        } else {
+            Action::None
         }
     }
 
@@ -190,6 +210,18 @@ impl App {
     }
 
     fn handle_detail_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(started) = self.edit_key_started.take() {
+            let plain_t = key.code == KeyCode::Char('t')
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            return if plain_t && started.elapsed() < EDIT_SEQUENCE_TIMEOUT {
+                Action::EditTitle
+            } else {
+                Action::EditDescription
+            };
+        }
+
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_dependency_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_dependency_cursor(-1),
@@ -209,7 +241,7 @@ impl App {
             }
             KeyCode::Enter => self.open_selected_dependency(),
             KeyCode::Char('e') if self.current_detail_issue().is_some() => {
-                return Action::EditDescription;
+                self.edit_key_started = Some(Instant::now());
             }
             KeyCode::Backspace => {
                 self.history.pop();
@@ -530,14 +562,22 @@ mod tests {
     }
 
     #[test]
-    fn e_in_task_view_requests_description_edit() {
+    fn e_in_task_view_requests_description_edit_after_the_sequence_timeout() {
         let mut app = App::new(graph());
         app.handle_key(key(KeyCode::Enter));
 
-        assert_eq!(
-            app.handle_key(key(KeyCode::Char('e'))),
-            Action::EditDescription
-        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
+        assert_eq!(app.flush_pending_key(), Action::EditDescription);
+        assert_eq!(app.current_detail_issue().unwrap().id, "a");
+    }
+
+    #[test]
+    fn e_then_t_in_task_view_requests_title_edit() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('t'))), Action::EditTitle);
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
     }
 

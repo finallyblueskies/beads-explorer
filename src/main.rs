@@ -23,6 +23,7 @@ Options:
 
 Tree:      j/k move · h/l fold · Tab toggle · Enter open · q/Esc quit
 Task view: j/k dependency · Enter open · e edit description · Backspace back · Esc tree
+           et edit title
 ";
 
 struct Options {
@@ -115,26 +116,44 @@ fn run(options: Options) -> io::Result<()> {
     loop {
         let (width, height) = terminal::size()?;
         ui::draw(&mut app, &mut out, width, height)?;
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => match app.handle_key(key) {
-                Action::Quit => break,
-                Action::EditDescription => {
-                    let Some(issue_id) = app.current_detail_issue().map(|issue| issue.id.clone())
-                    else {
-                        continue;
-                    };
-                    guard.restore(&mut out)?;
-                    let edit_result =
-                        model::edit_description(&options.bd, options.db.as_deref(), &issue_id)
-                            .and_then(|_| {
-                                model::load_issue(&options.bd, options.db.as_deref(), &issue_id)
-                            });
-                    guard.activate(&mut out)?;
-                    app.graph.replace_issue(edit_result?);
+        let action = if let Some(timeout) = app.pending_key_timeout() {
+            if event::poll(timeout)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                    _ => Action::None,
                 }
-                Action::None => {}
-            },
-            _ => {}
+            } else {
+                app.flush_pending_key()
+            }
+        } else {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                _ => Action::None,
+            }
+        };
+
+        match action {
+            Action::Quit => break,
+            action @ (Action::EditDescription | Action::EditTitle) => {
+                let Some(issue_id) = app.current_detail_issue().map(|issue| issue.id.clone())
+                else {
+                    continue;
+                };
+                guard.restore(&mut out)?;
+                let edit_result = match action {
+                    Action::EditDescription => {
+                        model::edit_description(&options.bd, options.db.as_deref(), &issue_id)
+                    }
+                    Action::EditTitle => {
+                        model::edit_title(&options.bd, options.db.as_deref(), &issue_id)
+                    }
+                    _ => unreachable!(),
+                }
+                .and_then(|_| model::load_issue(&options.bd, options.db.as_deref(), &issue_id));
+                guard.activate(&mut out)?;
+                app.graph.replace_issue(edit_result?);
+            }
+            Action::None => {}
         }
     }
 
