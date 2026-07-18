@@ -2,6 +2,8 @@
 
 `be` is a small, fast terminal explorer for [beads_rust](https://github.com/Dicklesworthstone/beads_rust) issue graphs. It asks the installed `br` command for JSON data, so it uses the same workspace discovery and database semantics as the main beads CLI.
 
+https://github.com/user-attachments/assets/8b451659-7dc7-4e6d-b95c-535d48496359
+
 ## Install
 
 ```sh
