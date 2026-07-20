@@ -27,7 +27,7 @@ Options:
   -h, --help        Print help
   -V, --version     Print version
 
-Tree:      + add child · j/k move · h/l fold · Tab toggle · Enter open · x close · q/Esc quit
+Tree:      + add child · j/k move · h/l fold · Tab toggle · Enter open · e edit description · x close · q/Esc quit
 Task view: + add child · j/k dependency · Enter open · e edit description · Backspace back · Esc tree
            et edit title · x close issue (with confirmation)
 

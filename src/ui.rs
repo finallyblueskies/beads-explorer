@@ -161,7 +161,7 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         )
     } else {
         format!(
-            "{} issue{} · + add child · / go to · j/k move · h/l fold · Enter open · x close · q quit",
+            "{} issue{} · + add child · / go to · j/k move · h/l fold · Enter open · e edit · x close · q quit",
             app.graph.len(),
             if app.graph.len() == 1 { "" } else { "s" }
         )

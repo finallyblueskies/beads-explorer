@@ -206,8 +206,9 @@ pub fn load(bd: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
         args.extend(["--db", path]);
     }
     let issues = parse_issue_collection(run_bd_json(bd, &args)?)?;
-    let (listed, context): (Vec<Issue>, Vec<Issue>) =
-        issues.into_iter().partition(|issue| issue.status == "open");
+    let (listed, context): (Vec<Issue>, Vec<Issue>) = issues
+        .into_iter()
+        .partition(|issue| matches!(issue.status.as_str(), "open" | "in_progress"));
     if listed.is_empty() {
         return Ok(IssueGraph::default());
     }
@@ -525,6 +526,34 @@ mod tests {
         assert_eq!(deps[0].dependency_type, "blocks");
         assert_eq!(deps[1].id, "c");
         assert_eq!(deps[1].dependency_type, "parent-child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_lists_open_and_in_progress_issues_by_default() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let script =
+            std::env::temp_dir().join(format!("be-fake-bd-load-{}-{nonce}", std::process::id()));
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '[{\"id\":\"open\",\"status\":\"open\"},{\"id\":\"working\",\"status\":\"in_progress\"},{\"id\":\"closed\",\"status\":\"closed\"}]'\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let graph = load(script.as_os_str(), None).unwrap();
+
+        assert!(graph.is_listed("open"));
+        assert!(graph.is_listed("working"));
+        assert!(!graph.is_listed("closed"));
+        assert_eq!(graph.len(), 2);
+
+        let _ = fs::remove_file(script);
     }
 
     #[cfg(unix)]

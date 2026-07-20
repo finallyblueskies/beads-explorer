@@ -320,6 +320,10 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.expand_or_enter(),
             KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(),
             KeyCode::Enter => self.open_selected_issue(),
+            KeyCode::Char('e') => {
+                self.open_selected_issue();
+                return Action::EditDescription;
+            }
             KeyCode::Char('x') => self.start_close_confirmation(),
             KeyCode::Char('+') => self.start_add_issue(),
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
@@ -1057,6 +1061,18 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
         assert_eq!(app.flush_pending_key(), Action::EditDescription);
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
+    }
+
+    #[test]
+    fn e_in_tree_requests_description_edit_for_the_selected_issue() {
+        let mut app = App::new(graph());
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Action::EditDescription
+        );
+        assert_eq!(app.current_detail_issue().unwrap().id, "a");
+        assert_eq!(app.screen(), Screen::Detail);
     }
 
     #[test]
