@@ -11,6 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SEPARATOR: &str = " │ ";
 const HIGHLIGHT_BACKGROUND: Color = Color::AnsiValue(238);
+const MODAL_BACKGROUND: Color = Color::AnsiValue(235);
 
 #[derive(Clone, Copy)]
 enum LineStyle {
@@ -33,6 +34,9 @@ pub fn draw(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io:
     match app.screen() {
         Screen::Tree => draw_tree(app, out, width, height)?,
         Screen::Detail => draw_detail(app, out, width, height)?,
+    }
+    if let Some(issue_id) = app.closing_issue_id() {
+        draw_close_confirmation(out, width, height, issue_id)?;
     }
     queue!(out, EndSynchronizedUpdate)?;
     out.flush()
@@ -147,7 +151,7 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         )
     } else {
         format!(
-            "{} issue{} · / go to · j/k move · h/l fold · Enter open · q quit",
+            "{} issue{} · / go to · j/k move · h/l fold · Enter open · x close · q quit",
             app.graph.len(),
             if app.graph.len() == 1 { "" } else { "s" }
         )
@@ -223,9 +227,7 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
         Clear(ClearType::FromCursorDown)
     )?;
 
-    let footer = if app.is_confirming_close() {
-        format!("Close issue {}? y confirm · n/Esc cancel", issue.id)
-    } else if app.can_close_current_issue() {
+    let footer = if app.can_close_current_issue() {
         "j/k dependency · Enter open · e description · et title · x close · Backspace back · Esc tree · q quit"
             .to_string()
     } else {
@@ -236,19 +238,110 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
         out,
         MoveTo(0, height - 1),
         Clear(ClearType::CurrentLine),
-        SetForegroundColor(if app.is_confirming_close() {
-            Color::Yellow
-        } else {
-            Color::Reset
-        }),
-        SetAttribute(if app.is_confirming_close() {
+        SetAttribute(Attribute::Dim),
+        Print(truncate(&footer, width)),
+        SetAttribute(Attribute::Reset),
+    )?;
+    Ok(())
+}
+
+fn draw_close_confirmation(
+    out: &mut impl Write,
+    width: u16,
+    height: u16,
+    issue_id: &str,
+) -> io::Result<()> {
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+
+    let title = " Confirm close ";
+    let message = format!("Close issue {issue_id}?");
+    let actions = "[y] Yes    [n/Esc] No";
+    if width < 4 || height < 3 {
+        let prompt = format!("{message} y/n");
+        queue!(
+            out,
+            MoveTo(0, height - 1),
+            SetForegroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold),
+            Print(truncate(&prompt, width as usize)),
+            ResetColor,
+            SetAttribute(Attribute::Reset)
+        )?;
+        return Ok(());
+    }
+
+    let desired_width = message
+        .width()
+        .max(actions.width())
+        .max(title.width())
+        .saturating_add(4);
+    let modal_width = desired_width.min(width as usize).max(4);
+    let body_lines: Vec<&str> = if height >= 5 {
+        vec![message.as_str(), "", actions]
+    } else if height == 4 {
+        vec![message.as_str(), actions]
+    } else {
+        vec![message.as_str()]
+    };
+    let modal_height = body_lines.len() + 2;
+    let left = (width as usize - modal_width) / 2;
+    let top = (height as usize - modal_height) / 2;
+    let inner_width = modal_width - 2;
+
+    let top_border = if title.width() <= inner_width {
+        format!(
+            "╭{title}{}╮",
+            "─".repeat(inner_width.saturating_sub(title.width()))
+        )
+    } else {
+        format!("╭{}╮", "─".repeat(inner_width))
+    };
+    draw_modal_line(out, left, top, &top_border, modal_width, true)?;
+    for (index, line) in body_lines.iter().enumerate() {
+        let content_width = inner_width.saturating_sub(2);
+        let content = truncate(line, content_width);
+        let body = format!(
+            "│ {}{} │",
+            content,
+            " ".repeat(content_width.saturating_sub(content.width()))
+        );
+        draw_modal_line(out, left, top + index + 1, &body, modal_width, false)?;
+    }
+    let bottom_border = format!("╰{}╯", "─".repeat(inner_width));
+    draw_modal_line(
+        out,
+        left,
+        top + modal_height - 1,
+        &bottom_border,
+        modal_width,
+        true,
+    )?;
+    Ok(())
+}
+
+fn draw_modal_line(
+    out: &mut impl Write,
+    x: usize,
+    y: usize,
+    line: &str,
+    width: usize,
+    border: bool,
+) -> io::Result<()> {
+    queue!(
+        out,
+        MoveTo(x as u16, y as u16),
+        SetBackgroundColor(MODAL_BACKGROUND),
+        SetForegroundColor(if border { Color::Cyan } else { Color::White }),
+        SetAttribute(if border {
             Attribute::Bold
         } else {
-            Attribute::Dim
+            Attribute::NormalIntensity
         }),
-        Print(truncate(&footer, width)),
+        Print(pad(line, width)),
         ResetColor,
-        SetAttribute(Attribute::Reset),
+        SetAttribute(Attribute::Reset)
     )?;
     Ok(())
 }
@@ -610,6 +703,30 @@ fn wrap(value: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Issue, IssueGraph};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn close_confirmation_renders_as_a_floating_bordered_modal() {
+        let mut app = App::new(IssueGraph::new(
+            vec![Issue {
+                id: "task-1".into(),
+                title: "A task".into(),
+                ..Issue::default()
+            }],
+            vec![],
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        let mut output = Vec::new();
+        draw(&mut app, &mut output, 80, 20).unwrap();
+        let rendered = String::from_utf8_lossy(&output);
+
+        assert!(rendered.contains("╭ Confirm close "));
+        assert!(rendered.contains("Close issue task-1?"));
+        assert!(rendered.contains("[y] Yes    [n/Esc] No"));
+        assert!(rendered.contains('╰'));
+    }
 
     #[test]
     fn type_labels_are_never_wider_than_four() {

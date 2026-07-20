@@ -26,11 +26,11 @@ pub enum Screen {
     Detail,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
     Quit,
-    CloseIssue,
+    CloseIssue(String),
     EditDescription,
     EditTitle,
 }
@@ -47,7 +47,7 @@ pub struct App {
     tree_rows: Vec<TreeRow>,
     expanded: HashSet<Vec<String>>,
     history: Vec<DetailFrame>,
-    confirming_close: bool,
+    confirming_close: Option<String>,
     edit_key_started: Option<Instant>,
 }
 
@@ -65,7 +65,7 @@ impl App {
             tree_rows: Vec::new(),
             expanded: HashSet::new(),
             history: Vec::new(),
-            confirming_close: false,
+            confirming_close: None,
             edit_key_started: None,
         };
         app.rebuild_rows();
@@ -105,7 +105,11 @@ impl App {
     }
 
     pub fn is_confirming_close(&self) -> bool {
-        self.confirming_close
+        self.confirming_close.is_some()
+    }
+
+    pub fn closing_issue_id(&self) -> Option<&str> {
+        self.confirming_close.as_deref()
     }
 
     pub fn can_close_current_issue(&self) -> bool {
@@ -123,9 +127,21 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.confirming_close = false;
+            self.confirming_close = None;
             self.edit_key_started = None;
             return Action::Quit;
+        }
+        if self.confirming_close.is_some() {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    Action::CloseIssue(self.confirming_close.take().unwrap())
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirming_close = None;
+                    Action::None
+                }
+                _ => Action::None,
+            };
         }
         match self.screen() {
             Screen::Tree => self.handle_tree_key(key),
@@ -177,6 +193,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.expand_or_enter(),
             KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(),
             KeyCode::Enter => self.open_selected_issue(),
+            KeyCode::Char('x') => self.start_close_confirmation(),
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             _ => {}
         }
@@ -223,20 +240,6 @@ impl App {
     }
 
     fn handle_detail_key(&mut self, key: KeyEvent) -> Action {
-        if self.confirming_close {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.confirming_close = false;
-                    return Action::CloseIssue;
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.confirming_close = false;
-                }
-                _ => {}
-            }
-            return Action::None;
-        }
-
         if let Some(started) = self.edit_key_started.take() {
             let plain_t = key.code == KeyCode::Char('t')
                 && !key
@@ -271,7 +274,7 @@ impl App {
                 self.edit_key_started = Some(Instant::now());
             }
             KeyCode::Char('x') if self.can_close_current_issue() => {
-                self.confirming_close = true;
+                self.start_close_confirmation();
             }
             KeyCode::Backspace => {
                 self.history.pop();
@@ -307,6 +310,106 @@ impl App {
                 scroll: 0,
             });
         }
+    }
+
+    fn start_close_confirmation(&mut self) {
+        let issue_id = match self.screen() {
+            Screen::Tree => self.current_tree_issue(),
+            Screen::Detail => self.current_detail_issue(),
+        }
+        .filter(|issue| self.graph.is_listed(&issue.id))
+        .map(|issue| issue.id.clone());
+        self.confirming_close = issue_id;
+    }
+
+    pub fn return_to_tree(&mut self) {
+        self.history.clear();
+        self.confirming_close = None;
+        self.edit_key_started = None;
+    }
+
+    /// Replace data loaded from `bd` without resetting the user's place in the tree.
+    /// Exact paths win; issue IDs are the fallback when dependency changes move a branch.
+    pub fn refresh_graph(&mut self, graph: IssueGraph) {
+        let (selected_path, selected_issue_id, old_cursor, old_scroll) =
+            if self.search_query.is_some() {
+                let cursor = self
+                    .search_origin_cursor
+                    .min(self.tree_rows.len().saturating_sub(1));
+                let row = self.tree_rows.get(cursor);
+                (
+                    row.map(|row| row.path.clone()),
+                    row.map(|row| row.issue_id.clone()),
+                    cursor,
+                    self.search_origin_scroll,
+                )
+            } else {
+                let row = self.rows.get(self.cursor);
+                (
+                    row.map(|row| row.path.clone()),
+                    row.map(|row| row.issue_id.clone()),
+                    self.cursor,
+                    self.scroll,
+                )
+            };
+        let viewport_offset = old_cursor.saturating_sub(old_scroll);
+        let moved_expanded_issue_ids: HashSet<String> = self
+            .expanded
+            .iter()
+            .filter(|path| !Self::tree_path_exists(&graph, path))
+            .filter_map(|path| path.last().cloned())
+            .collect();
+
+        self.graph = graph;
+        self.search_query = None;
+        self.confirming_close = None;
+        self.edit_key_started = None;
+
+        let (rows, restored_expansions) = self.build_rows(Some(&moved_expanded_issue_ids));
+        self.expanded.extend(restored_expansions);
+        self.rows = rows;
+        self.tree_rows.clone_from(&self.rows);
+
+        let exact = selected_path
+            .as_ref()
+            .and_then(|path| self.rows.iter().position(|row| &row.path == path));
+        let by_issue = selected_issue_id.as_ref().and_then(|issue_id| {
+            self.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| &row.issue_id == issue_id)
+                .min_by_key(|(position, _)| position.abs_diff(old_cursor))
+                .map(|(position, _)| position)
+        });
+        self.cursor = exact
+            .or(by_issue)
+            .unwrap_or(old_cursor)
+            .min(self.rows.len().saturating_sub(1));
+        self.scroll = self.cursor.saturating_sub(viewport_offset);
+
+        self.history
+            .retain(|frame| self.graph.issue(&frame.issue_id).is_some());
+        for frame in &mut self.history {
+            let last_dependency = self
+                .graph
+                .issue(&frame.issue_id)
+                .map(|issue| issue.dependencies.len().saturating_sub(1))
+                .unwrap_or(0);
+            frame.dependency_cursor = frame.dependency_cursor.min(last_dependency);
+        }
+    }
+
+    fn tree_path_exists(graph: &IssueGraph, path: &[String]) -> bool {
+        let Some(root) = path.first() else {
+            return false;
+        };
+        graph.roots().contains(root)
+            && path.windows(2).all(|edge| {
+                graph
+                    .tree_children(&edge[0])
+                    .iter()
+                    .any(|child| child == &edge[1])
+            })
     }
 
     fn start_search(&mut self) {
@@ -420,20 +523,28 @@ impl App {
         }
     }
 
-    fn rebuild_rows(&mut self) {
+    fn build_rows(
+        &self,
+        expanded_issue_ids: Option<&HashSet<String>>,
+    ) -> (Vec<TreeRow>, HashSet<Vec<String>>) {
         fn walk(
             graph: &IssueGraph,
             expanded: &HashSet<Vec<String>>,
+            expanded_issue_ids: Option<&HashSet<String>>,
             path: &[String],
             prefix: &str,
             rows: &mut Vec<TreeRow>,
+            restored_expansions: &mut HashSet<Vec<String>>,
         ) {
-            if !expanded.contains(path) {
-                return;
-            }
             let Some(issue_id) = path.last() else {
                 return;
             };
+            if !expanded.contains(path)
+                && !expanded_issue_ids.is_some_and(|ids| ids.contains(issue_id))
+            {
+                return;
+            }
+            restored_expansions.insert(path.to_vec());
             let children = graph.tree_children(issue_id);
             let count = children.len();
             for (index, child_id) in children.iter().enumerate() {
@@ -451,16 +562,18 @@ impl App {
                     walk(
                         graph,
                         expanded,
+                        expanded_issue_ids,
                         &child_path,
                         &format!("{prefix}{}", if last { "    " } else { "│   " }),
                         rows,
+                        restored_expansions,
                     );
                 }
             }
         }
 
-        let selected_path = self.rows.get(self.cursor).map(|row| row.path.clone());
         let mut rows = Vec::new();
+        let mut restored_expansions = HashSet::new();
         for root in self.graph.roots() {
             let path = vec![root.clone()];
             rows.push(TreeRow {
@@ -469,8 +582,22 @@ impl App {
                 prefix: String::new(),
                 cycle: false,
             });
-            walk(&self.graph, &self.expanded, &path, "", &mut rows);
+            walk(
+                &self.graph,
+                &self.expanded,
+                expanded_issue_ids,
+                &path,
+                "",
+                &mut rows,
+                &mut restored_expansions,
+            );
         }
+        (rows, restored_expansions)
+    }
+
+    fn rebuild_rows(&mut self) {
+        let selected_path = self.rows.get(self.cursor).map(|row| row.path.clone());
+        let (rows, _) = self.build_rows(None);
         self.rows = rows;
         self.tree_rows.clone_from(&self.rows);
 
@@ -618,9 +745,26 @@ mod tests {
 
         assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Action::None);
         assert!(app.is_confirming_close());
-        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Action::CloseIssue);
+        assert_eq!(app.closing_issue_id(), Some("a"));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            Action::CloseIssue("a".into())
+        );
         assert!(!app.is_confirming_close());
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
+    }
+
+    #[test]
+    fn x_in_tree_view_closes_the_selected_issue_after_confirmation() {
+        let mut app = App::new(graph());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Action::None);
+        assert_eq!(app.closing_issue_id(), Some("a"));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            Action::CloseIssue("a".into())
+        );
+        assert_eq!(app.screen(), Screen::Tree);
     }
 
     #[test]
@@ -658,6 +802,141 @@ mod tests {
         assert!(!app.can_close_current_issue());
         assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Action::None);
         assert!(!app.is_confirming_close());
+    }
+
+    #[test]
+    fn refresh_preserves_tree_state_when_closing_reparents_dependencies() {
+        let mut app = App::new(IssueGraph::new(
+            vec![
+                Issue {
+                    id: "a".into(),
+                    dependencies: vec![Dependency {
+                        id: "b".into(),
+                        ..Dependency::default()
+                    }],
+                    ..Issue::default()
+                },
+                Issue {
+                    id: "b".into(),
+                    dependencies: vec![Dependency {
+                        id: "c".into(),
+                        ..Dependency::default()
+                    }],
+                    ..Issue::default()
+                },
+                Issue {
+                    id: "c".into(),
+                    ..Issue::default()
+                },
+            ],
+            vec![],
+        ));
+        app.handle_key(key(KeyCode::Char('l')));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(
+            app.rows
+                .iter()
+                .map(|row| row.issue_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+
+        app.cursor = 0;
+        app.scroll = 0;
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            Action::CloseIssue("a".into())
+        );
+
+        // `bd` removes closed a from the open list, making b a root. Its expanded
+        // state follows the issue identity so c stays visible on the moved branch.
+        app.return_to_tree();
+        app.refresh_graph(IssueGraph::new(
+            vec![
+                Issue {
+                    id: "b".into(),
+                    dependencies: vec![Dependency {
+                        id: "c".into(),
+                        ..Dependency::default()
+                    }],
+                    ..Issue::default()
+                },
+                Issue {
+                    id: "c".into(),
+                    ..Issue::default()
+                },
+            ],
+            vec![],
+        ));
+
+        assert_eq!(
+            app.rows
+                .iter()
+                .map(|row| row.issue_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+        assert_eq!(app.current_tree_issue().unwrap().id, "b");
+        assert!(app.row_is_expanded(&app.rows[0]));
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn refresh_keeps_path_specific_expansion_when_topology_is_unchanged() {
+        let shared_graph = || {
+            IssueGraph::new(
+                vec![
+                    Issue {
+                        id: "a".into(),
+                        dependencies: vec![Dependency {
+                            id: "c".into(),
+                            ..Dependency::default()
+                        }],
+                        ..Issue::default()
+                    },
+                    Issue {
+                        id: "d".into(),
+                        dependencies: vec![Dependency {
+                            id: "c".into(),
+                            ..Dependency::default()
+                        }],
+                        ..Issue::default()
+                    },
+                    Issue {
+                        id: "c".into(),
+                        dependencies: vec![Dependency {
+                            id: "e".into(),
+                            ..Dependency::default()
+                        }],
+                        ..Issue::default()
+                    },
+                    Issue {
+                        id: "e".into(),
+                        ..Issue::default()
+                    },
+                ],
+                vec![],
+            )
+        };
+        let mut app = App::new(shared_graph());
+        app.handle_key(key(KeyCode::Char('l'))); // expand a
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('l'))); // expand c under a
+        app.cursor = 3;
+        app.handle_key(key(KeyCode::Char('l'))); // expand d, but not c under d
+
+        app.refresh_graph(shared_graph());
+
+        assert_eq!(
+            app.rows
+                .iter()
+                .map(|row| row.issue_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c", "e", "d", "c"]
+        );
+        assert_eq!(app.current_tree_issue().unwrap().id, "d");
     }
 
     #[test]
