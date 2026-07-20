@@ -35,4 +35,4 @@ While go-to is open, type any part of an issue ID; matching is case-insensitive 
 
 ## Planned improvements
 
-- Quick edit issue status and title from task view
+- Status/priority update menus
