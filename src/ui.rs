@@ -143,6 +143,10 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         Clear(ClearType::FromCursorDown)
     )?;
 
+    if let Some(status) = app.status_message() {
+        return draw_status_line(out, width, height, status);
+    }
+
     let footer = if let Some(query) = app.search_query() {
         format!(
             "/{query}  · {} match{} · ↑/↓ select · Enter open · Esc cancel",
@@ -227,6 +231,10 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
         Clear(ClearType::FromCursorDown)
     )?;
 
+    if let Some(status) = app.status_message() {
+        return draw_status_line(out, width, height, status);
+    }
+
     let footer = if app.can_close_current_issue() {
         "j/k dependency · Enter open · e description · et title · x close · Backspace back · Esc tree · q quit"
             .to_string()
@@ -243,6 +251,24 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
         SetAttribute(Attribute::Reset),
     )?;
     Ok(())
+}
+
+fn draw_status_line(
+    out: &mut impl Write,
+    width: usize,
+    height: u16,
+    status: &str,
+) -> io::Result<()> {
+    queue!(
+        out,
+        MoveTo(0, height - 1),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(Color::Yellow),
+        SetAttribute(Attribute::Bold),
+        Print(truncate(status, width)),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
+    )
 }
 
 fn draw_close_confirmation(
@@ -726,6 +752,26 @@ mod tests {
         assert!(rendered.contains("Close issue task-1?"));
         assert!(rendered.contains("[y] Yes    [n/Esc] No"));
         assert!(rendered.contains('╰'));
+    }
+
+    #[test]
+    fn status_message_replaces_the_footer_hints() {
+        let mut app = App::new(IssueGraph::new(
+            vec![Issue {
+                id: "task-1".into(),
+                title: "A task".into(),
+                ..Issue::default()
+            }],
+            vec![],
+        ));
+        app.set_status("bd close failed: boom".to_string());
+
+        let mut output = Vec::new();
+        draw(&mut app, &mut output, 80, 20).unwrap();
+        let rendered = String::from_utf8_lossy(&output);
+
+        assert!(rendered.contains("bd close failed: boom"));
+        assert!(!rendered.contains("q quit"));
     }
 
     #[test]

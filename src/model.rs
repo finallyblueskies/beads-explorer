@@ -170,6 +170,30 @@ impl IssueGraph {
     pub fn replace_issue(&mut self, issue: Issue) {
         self.issues.insert(issue.id.clone(), issue);
     }
+
+    /// Optimistic local mirror of `bd close`: the issue leaves the listed set
+    /// and joins the context issues, so the UI can update before `bd` confirms.
+    pub fn with_issue_closed(&self, issue_id: &str) -> IssueGraph {
+        let listed_issues: Vec<Issue> = self
+            .order
+            .iter()
+            .filter(|id| id.as_str() != issue_id)
+            .filter_map(|id| self.issues.get(id))
+            .cloned()
+            .collect();
+        let mut context: Vec<Issue> = self
+            .issues
+            .values()
+            .filter(|issue| !self.listed.contains(&issue.id))
+            .cloned()
+            .collect();
+        if let Some(issue) = self.issues.get(issue_id) {
+            let mut issue = issue.clone();
+            issue.status = "closed".to_string();
+            context.push(issue);
+        }
+        IssueGraph::new(listed_issues, context)
+    }
 }
 
 pub fn load(bd: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
@@ -389,6 +413,18 @@ mod tests {
         assert!(!graph.is_listed("z"));
         assert_eq!(graph.len(), 1);
         assert_eq!(graph.roots(), &["a"]);
+    }
+
+    #[test]
+    fn with_issue_closed_moves_the_issue_into_context() {
+        let graph = IssueGraph::new(vec![issue("a", &["b"]), issue("b", &[])], vec![]);
+
+        let closed = graph.with_issue_closed("a");
+
+        assert_eq!(closed.roots(), &["b"]);
+        assert!(!closed.is_listed("a"));
+        assert!(closed.is_listed("b"));
+        assert_eq!(closed.issue("a").unwrap().status, "closed");
     }
 
     #[test]

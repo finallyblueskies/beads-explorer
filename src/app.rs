@@ -49,6 +49,7 @@ pub struct App {
     history: Vec<DetailFrame>,
     confirming_close: Option<String>,
     edit_key_started: Option<Instant>,
+    status_message: Option<String>,
 }
 
 impl App {
@@ -67,6 +68,7 @@ impl App {
             history: Vec::new(),
             confirming_close: None,
             edit_key_started: None,
+            status_message: None,
         };
         app.rebuild_rows();
         app
@@ -112,6 +114,18 @@ impl App {
         self.confirming_close.as_deref()
     }
 
+    pub fn status_message(&self) -> Option<&str> {
+        self.status_message.as_deref()
+    }
+
+    pub fn set_status(&mut self, message: String) {
+        self.status_message = Some(message);
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
+    }
+
     pub fn can_close_current_issue(&self) -> bool {
         self.current_detail_issue()
             .is_some_and(|issue| self.graph.is_listed(&issue.id))
@@ -126,6 +140,7 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        self.status_message = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.confirming_close = None;
             self.edit_key_started = None;
@@ -241,15 +256,19 @@ impl App {
 
     fn handle_detail_key(&mut self, key: KeyEvent) -> Action {
         if let Some(started) = self.edit_key_started.take() {
-            let plain_t = key.code == KeyCode::Char('t')
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-            return if plain_t && started.elapsed() < EDIT_SEQUENCE_TIMEOUT {
-                Action::EditTitle
-            } else {
-                Action::EditDescription
-            };
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if started.elapsed() >= EDIT_SEQUENCE_TIMEOUT {
+                return Action::EditDescription;
+            }
+            if plain && key.code == KeyCode::Char('t') {
+                return Action::EditTitle;
+            }
+            if plain && key.code == KeyCode::Char('e') {
+                return Action::EditDescription;
+            }
+            // Any other key cancels the sequence and is handled normally below.
         }
 
         match key.code {
@@ -364,6 +383,12 @@ impl App {
         self.search_query = None;
         self.confirming_close = None;
         self.edit_key_started = None;
+
+        // Paths that left the tree must not linger: a later refresh could
+        // recreate one and surprise-expand a branch the user never opened.
+        let current_graph = &self.graph;
+        self.expanded
+            .retain(|path| Self::tree_path_exists(current_graph, path));
 
         let (rows, restored_expansions) = self.build_rows(Some(&moved_expanded_issue_ids));
         self.expanded.extend(restored_expansions);
@@ -736,6 +761,57 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
         assert_eq!(app.handle_key(key(KeyCode::Char('t'))), Action::EditTitle);
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
+    }
+
+    #[test]
+    fn e_then_an_unrelated_key_cancels_the_sequence_and_handles_the_key() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::Quit);
+        assert_eq!(app.flush_pending_key(), Action::None);
+    }
+
+    #[test]
+    fn e_pressed_twice_requests_description_edit_immediately() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Action::EditDescription
+        );
+    }
+
+    #[test]
+    fn status_message_clears_on_the_next_key() {
+        let mut app = App::new(graph());
+        app.set_status("Closing a…".to_string());
+        assert_eq!(app.status_message(), Some("Closing a…"));
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.status_message(), None);
+    }
+
+    #[test]
+    fn refresh_forgets_expansion_of_issues_that_left_the_graph() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.rows.len(), 2);
+
+        app.refresh_graph(IssueGraph::new(
+            vec![Issue {
+                id: "b".into(),
+                ..Issue::default()
+            }],
+            vec![],
+        ));
+        app.refresh_graph(graph());
+
+        assert_eq!(app.rows.len(), 1, "a must come back collapsed");
+        assert!(!app.row_is_expanded(&app.rows[0]));
     }
 
     #[test]
