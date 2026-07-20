@@ -222,6 +222,61 @@ pub fn edit_title(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<(
     edit_field(bd, db, issue_id, "--title")
 }
 
+pub fn create_issue(
+    bd: &OsStr,
+    db: Option<&Path>,
+    parent_id: &str,
+    title: &str,
+    description: &str,
+    issue_type: &str,
+    priority: i32,
+) -> io::Result<String> {
+    let mut command = Command::new(bd);
+    let priority = format!("P{priority}");
+    command
+        .arg("create")
+        .arg(title)
+        .args(["--description", description])
+        .args(["--type", issue_type])
+        .args(["--priority", priority.as_str()])
+        .args(["--parent", parent_id])
+        .arg("--silent");
+    if let Some(path) = db {
+        command.arg("--db").arg(path);
+    }
+
+    let output = command.output().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not run {}: {error}", bd.to_string_lossy()),
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(io::Error::other(if message.is_empty() {
+            format!("{} create failed: {}", bd.to_string_lossy(), output.status)
+        } else {
+            format!("{} create failed: {message}", bd.to_string_lossy())
+        }));
+    }
+
+    let issue_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if issue_id.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} create returned no issue ID", bd.to_string_lossy()),
+        ))
+    } else {
+        Ok(issue_id)
+    }
+}
+
 pub fn close_issue(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
     let mut command = Command::new(bd);
     command.args(["close", issue_id]);
@@ -361,6 +416,13 @@ fn parse_issue_collection(value: Value) -> io::Result<Vec<Issue>> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     fn issue(id: &str, deps: &[&str]) -> Issue {
         Issue {
             id: id.to_string(),
@@ -463,5 +525,65 @@ mod tests {
         assert_eq!(deps[0].dependency_type, "blocks");
         assert_eq!(deps[1].id, "c");
         assert_eq!(deps[1].dependency_type, "parent-child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_issue_passes_parent_type_and_p1_to_bd() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir();
+        let script = directory.join(format!("be-fake-bd-{}-{nonce}", std::process::id()));
+        let arguments = directory.join(format!("be-fake-bd-args-{}-{nonce}", std::process::id()));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'child-1\\n'\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let issue_id = create_issue(
+            script.as_os_str(),
+            Some(Path::new("/tmp/example.db")),
+            "parent-1",
+            "Child title",
+            "Body text",
+            "feature",
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(issue_id, "child-1");
+        assert_eq!(
+            fs::read_to_string(&arguments)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![
+                "create",
+                "Child title",
+                "--description",
+                "Body text",
+                "--type",
+                "feature",
+                "--priority",
+                "P1",
+                "--parent",
+                "parent-1",
+                "--silent",
+                "--db",
+                "/tmp/example.db",
+            ]
+        );
+
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_file(arguments);
     }
 }

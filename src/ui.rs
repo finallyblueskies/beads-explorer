@@ -1,4 +1,4 @@
-use crate::app::{App, Screen};
+use crate::app::{AddIssueStep, App, Screen, ISSUE_TYPES, PRIORITIES};
 use crate::model::Issue;
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
@@ -34,6 +34,12 @@ pub fn draw(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io:
     match app.screen() {
         Screen::Tree => draw_tree(app, out, width, height)?,
         Screen::Detail => draw_detail(app, out, width, height)?,
+    }
+    if let Some(flow) = app.add_issue_flow() {
+        draw_add_issue(out, width, height, flow, app.status_message())?;
+        if flow.is_confirming_cancel() {
+            draw_add_issue_cancel_confirmation(out, width, height)?;
+        }
     }
     if let Some(issue_id) = app.closing_issue_id() {
         draw_close_confirmation(out, width, height, issue_id)?;
@@ -155,7 +161,7 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         )
     } else {
         format!(
-            "{} issue{} · / go to · j/k move · h/l fold · Enter open · x close · q quit",
+            "{} issue{} · + add child · / go to · j/k move · h/l fold · Enter open · x close · q quit",
             app.graph.len(),
             if app.graph.len() == 1 { "" } else { "s" }
         )
@@ -236,10 +242,10 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
     }
 
     let footer = if app.can_close_current_issue() {
-        "j/k dependency · Enter open · e description · et title · x close · Backspace back · Esc tree · q quit"
+        "+ add child · j/k dependency · Enter open · e description · et title · x close · Backspace back · Esc tree · q quit"
             .to_string()
     } else {
-        "j/k dependency · Enter open · e description · et title · Backspace back · Esc tree · q quit"
+        "+ add child · j/k dependency · Enter open · e description · et title · Backspace back · Esc tree · q quit"
             .to_string()
     };
     queue!(
@@ -345,6 +351,160 @@ fn draw_close_confirmation(
         true,
     )?;
     Ok(())
+}
+
+fn draw_add_issue(
+    out: &mut impl Write,
+    width: u16,
+    height: u16,
+    flow: &crate::app::AddIssueFlow,
+    status: Option<&str>,
+) -> io::Result<()> {
+    let mut lines = vec![format!("Parent: {}", flow.parent_id), String::new()];
+    match flow.step {
+        AddIssueStep::Title => {
+            lines.push("Title".to_string());
+            lines.push(format!("> {}▏", flow.title));
+            lines.push(String::new());
+            lines.push("Type a title · Enter continue · e $EDITOR · Esc cancel".to_string());
+        }
+        AddIssueStep::Description => {
+            lines.push("Description".to_string());
+            let preview = flow.description.replace('\n', " ↵ ");
+            lines.push(format!("> {}▏", preview));
+            lines.push(String::new());
+            lines.push("Type a description · Enter continue · e $EDITOR · Esc cancel".to_string());
+        }
+        AddIssueStep::IssueType => {
+            lines.push("Select issue type".to_string());
+            lines.extend(ISSUE_TYPES.iter().enumerate().map(|(index, issue_type)| {
+                format!(
+                    "{} {}",
+                    if index == flow.issue_type_index {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    issue_type
+                )
+            }));
+            lines.push(
+                "j/k or ↑/↓ select · Enter continue · Backspace previous · Esc cancel".to_string(),
+            );
+        }
+        AddIssueStep::Priority => {
+            lines.push("Select priority (P1 is the default)".to_string());
+            lines.extend(PRIORITIES.iter().enumerate().map(|(index, priority)| {
+                format!(
+                    "{} P{}{}",
+                    if index == flow.priority_index {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    priority,
+                    if *priority == 1 { "  default" } else { "" }
+                )
+            }));
+            lines.push(
+                "j/k or ↑/↓ select · Enter create · Backspace previous · Esc cancel".to_string(),
+            );
+        }
+    }
+    if let Some(status) = status {
+        lines.push(String::new());
+        lines.push(format!("Error: {status}"));
+    }
+    draw_floating_modal(
+        out,
+        width,
+        height,
+        &format!(" Add child issue · {}/4 ", flow.step.number()),
+        &lines,
+    )
+}
+
+fn draw_add_issue_cancel_confirmation(
+    out: &mut impl Write,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    draw_floating_modal(
+        out,
+        width,
+        height,
+        " Discard new issue? ",
+        &[
+            "The issue has not been created.".to_string(),
+            String::new(),
+            "[y] Discard    [n/Esc] Keep editing".to_string(),
+        ],
+    )
+}
+
+fn draw_floating_modal(
+    out: &mut impl Write,
+    width: u16,
+    height: u16,
+    title: &str,
+    lines: &[String],
+) -> io::Result<()> {
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    if width < 4 || height < 3 {
+        let fallback = lines.first().map(String::as_str).unwrap_or(title);
+        return queue!(
+            out,
+            MoveTo(0, height - 1),
+            SetAttribute(Attribute::Bold),
+            Print(truncate(fallback, width as usize)),
+            SetAttribute(Attribute::Reset)
+        );
+    }
+
+    let visible_lines = lines.len().min(height.saturating_sub(2) as usize);
+    let desired_width = lines
+        .iter()
+        .take(visible_lines)
+        .map(|line| line.width())
+        .max()
+        .unwrap_or(0)
+        .max(title.width())
+        .saturating_add(4);
+    let modal_width = desired_width.min(width as usize).max(4);
+    let modal_height = visible_lines + 2;
+    let left = (width as usize - modal_width) / 2;
+    let top = (height as usize - modal_height) / 2;
+    let inner_width = modal_width - 2;
+    let top_border = if title.width() <= inner_width {
+        format!(
+            "╭{title}{}╮",
+            "─".repeat(inner_width.saturating_sub(title.width()))
+        )
+    } else {
+        format!("╭{}╮", "─".repeat(inner_width))
+    };
+    draw_modal_line(out, left, top, &top_border, modal_width, true)?;
+    for (index, line) in lines.iter().take(visible_lines).enumerate() {
+        let content_width = inner_width.saturating_sub(2);
+        let content = truncate(line, content_width);
+        let body = format!(
+            "│ {}{} │",
+            content,
+            " ".repeat(content_width.saturating_sub(content.width()))
+        );
+        draw_modal_line(out, left, top + index + 1, &body, modal_width, false)?;
+    }
+    let bottom_border = format!("╰{}╯", "─".repeat(inner_width));
+    draw_modal_line(
+        out,
+        left,
+        top + modal_height - 1,
+        &bottom_border,
+        modal_width,
+        true,
+    )
 }
 
 fn draw_modal_line(
@@ -752,6 +912,33 @@ mod tests {
         assert!(rendered.contains("Close issue task-1?"));
         assert!(rendered.contains("[y] Yes    [n/Esc] No"));
         assert!(rendered.contains('╰'));
+    }
+
+    #[test]
+    fn add_issue_flow_and_discard_confirmation_render_as_modals() {
+        let mut app = App::new(IssueGraph::new(
+            vec![Issue {
+                id: "task-1".into(),
+                title: "A task".into(),
+                ..Issue::default()
+            }],
+            vec![],
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+
+        let mut output = Vec::new();
+        draw(&mut app, &mut output, 90, 24).unwrap();
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(rendered.contains("Add child issue · 1/4"));
+        assert!(rendered.contains("Parent: task-1"));
+        assert!(rendered.contains("e $EDITOR"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        output.clear();
+        draw(&mut app, &mut output, 90, 24).unwrap();
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(rendered.contains("Discard new issue?"));
+        assert!(rendered.contains("[y] Discard"));
     }
 
     #[test]

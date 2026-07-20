@@ -6,13 +6,13 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use std::env;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How often the event loop wakes to check on a background close.
 const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -27,9 +27,12 @@ Options:
   -h, --help        Print help
   -V, --version     Print version
 
-Tree:      j/k move · h/l fold · Tab toggle · Enter open · x close · q/Esc quit
-Task view: j/k dependency · Enter open · e edit description · Backspace back · Esc tree
+Tree:      + add child · j/k move · h/l fold · Tab toggle · Enter open · x close · q/Esc quit
+Task view: + add child · j/k dependency · Enter open · e edit description · Backspace back · Esc tree
            et edit title · x close issue (with confirmation)
+
+Add issue: Enter advances · j/k selects type/priority · e opens $EDITOR for text
+           Backspace returns to the previous selection · Esc asks before discarding
 ";
 
 struct Options {
@@ -119,6 +122,31 @@ fn parse_args() -> Result<Option<Options>, String> {
     Ok(Some(Options { bd, db }))
 }
 
+fn edit_add_issue_field(initial: &str) -> io::Result<String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = env::temp_dir().join(format!("be-add-{}-{nonce}.md", std::process::id()));
+    fs::write(&path, initial)?;
+
+    let result = (|| {
+        let status = Command::new("sh")
+            .args(["-c", "exec ${VISUAL:-${EDITOR:-vi}} \"$1\"", "be-editor"])
+            .arg(&path)
+            .status()
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("could not open editor: {error}"))
+            })?;
+        if !status.success() {
+            return Err(io::Error::other(format!("editor failed: {status}")));
+        }
+        fs::read_to_string(&path)
+    })();
+    let _ = fs::remove_file(&path);
+    result
+}
+
 fn run(options: Options) -> io::Result<()> {
     let graph = model::load(&options.bd, options.db.as_deref())?;
     let mut app = App::new(graph);
@@ -190,7 +218,11 @@ fn run(options: Options) -> io::Result<()> {
 
         match action {
             Action::Quit => break,
-            Action::CloseIssue(_) | Action::EditDescription | Action::EditTitle
+            Action::CloseIssue(_)
+            | Action::EditDescription
+            | Action::EditTitle
+            | Action::EditAddIssue(_)
+            | Action::CreateIssue(_)
                 if pending_close.is_some() =>
             {
                 app.set_status("waiting for the previous close to finish".to_string());
@@ -242,6 +274,39 @@ fn run(options: Options) -> io::Result<()> {
                     Err(error) => app.set_status(error.to_string()),
                 }
             }
+            Action::EditAddIssue(field) => {
+                let initial = app.add_issue_field(field).unwrap_or("").to_string();
+                guard.restore(&mut out)?;
+                let edit_result = edit_add_issue_field(&initial);
+                guard.activate(&mut out)?;
+                match edit_result {
+                    Ok(value) => app.set_add_issue_field(field, value),
+                    Err(error) => app.set_status(error.to_string()),
+                }
+            }
+            Action::CreateIssue(draft) => match model::create_issue(
+                &options.bd,
+                options.db.as_deref(),
+                &draft.parent_id,
+                &draft.title,
+                &draft.description,
+                &draft.issue_type,
+                draft.priority,
+            ) {
+                Ok(issue_id) => {
+                    app.finish_add_issue();
+                    match model::load(&options.bd, options.db.as_deref()) {
+                        Ok(graph) => {
+                            app.refresh_graph(graph);
+                            app.set_status(format!("Created {issue_id} under {}", draft.parent_id));
+                        }
+                        Err(error) => app.set_status(format!(
+                            "Created {issue_id}, but reload failed: {error} · view may be stale"
+                        )),
+                    }
+                }
+                Err(error) => app.set_status(error.to_string()),
+            },
             Action::None => {}
         }
     }

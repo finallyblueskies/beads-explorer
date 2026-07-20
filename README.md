@@ -24,6 +24,7 @@ Then run `be` anywhere that `bd list` works. The tree shows issues whose status 
 | `h` / `l`, Left / Right | Fold / expand | — |
 | `Tab` | Toggle fold | — |
 | `Enter` | Open task | Open dependency |
+| `+` | Add a child to the selected issue | Add a child to this issue |
 | `e` | — | Edit description in `$EDITOR` |
 | `x`, then `y` | Close selected issue after confirmation | Close issue after confirmation |
 | `/` | Fuzzy go-to by issue ID | — |
@@ -33,6 +34,8 @@ Then run `be` anywhere that `bd list` works. The tree shows issues whose status 
 
 While go-to is open, type any part of an issue ID; matching is case-insensitive and fuzzy, so the characters only need to appear in order. Search filters only the rows currently visible in the tree—children of collapsed issues are excluded. Use the arrow keys to select a match, `Enter` to open it, or `Esc` to cancel.
 
+Press `+` to create a child issue at the current location. The flow collects a title, description, issue type, and priority (P1 by default). Type text directly or press `e` on an empty title/description to use `$VISUAL`/`$EDITOR`; use `j`/`k` or the arrow keys for selections. `Esc` can cancel from any step after confirmation.
+
 ## Planned improvements
 
-- Quick edit issue status and title from task view
+- Quick edit issue status from task view

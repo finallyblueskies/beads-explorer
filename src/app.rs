@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 
 const EDIT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(500);
 
+pub const ISSUE_TYPES: [&str; 6] = ["task", "bug", "feature", "epic", "chore", "decision"];
+pub const PRIORITIES: [i32; 5] = [0, 1, 2, 3, 4];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeRow {
     pub issue_id: String,
@@ -26,6 +29,75 @@ pub enum Screen {
     Detail,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddIssueStep {
+    Title,
+    Description,
+    IssueType,
+    Priority,
+}
+
+impl AddIssueStep {
+    pub fn number(self) -> usize {
+        match self {
+            Self::Title => 1,
+            Self::Description => 2,
+            Self::IssueType => 3,
+            Self::Priority => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddIssueField {
+    Title,
+    Description,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddIssueDraft {
+    pub parent_id: String,
+    pub title: String,
+    pub description: String,
+    pub issue_type: String,
+    pub priority: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddIssueFlow {
+    pub parent_id: String,
+    pub title: String,
+    pub description: String,
+    pub step: AddIssueStep,
+    pub issue_type_index: usize,
+    pub priority_index: usize,
+    confirming_cancel: bool,
+}
+
+impl AddIssueFlow {
+    pub fn issue_type(&self) -> &'static str {
+        ISSUE_TYPES[self.issue_type_index]
+    }
+
+    pub fn priority(&self) -> i32 {
+        PRIORITIES[self.priority_index]
+    }
+
+    pub fn is_confirming_cancel(&self) -> bool {
+        self.confirming_cancel
+    }
+
+    fn draft(&self) -> AddIssueDraft {
+        AddIssueDraft {
+            parent_id: self.parent_id.clone(),
+            title: self.title.trim().to_string(),
+            description: self.description.trim_end().to_string(),
+            issue_type: self.issue_type().to_string(),
+            priority: self.priority(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -33,6 +105,8 @@ pub enum Action {
     CloseIssue(String),
     EditDescription,
     EditTitle,
+    EditAddIssue(AddIssueField),
+    CreateIssue(AddIssueDraft),
 }
 
 pub struct App {
@@ -48,6 +122,7 @@ pub struct App {
     expanded: HashSet<Vec<String>>,
     history: Vec<DetailFrame>,
     confirming_close: Option<String>,
+    add_issue: Option<AddIssueFlow>,
     edit_key_started: Option<Instant>,
     status_message: Option<String>,
 }
@@ -67,6 +142,7 @@ impl App {
             expanded: HashSet::new(),
             history: Vec::new(),
             confirming_close: None,
+            add_issue: None,
             edit_key_started: None,
             status_message: None,
         };
@@ -114,6 +190,38 @@ impl App {
         self.confirming_close.as_deref()
     }
 
+    pub fn add_issue_flow(&self) -> Option<&AddIssueFlow> {
+        self.add_issue.as_ref()
+    }
+
+    pub fn set_add_issue_field(&mut self, field: AddIssueField, value: String) {
+        let Some(flow) = self.add_issue.as_mut() else {
+            return;
+        };
+        match field {
+            AddIssueField::Title => {
+                flow.title = value
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+            AddIssueField::Description => flow.description = value.trim_end().to_string(),
+        }
+    }
+
+    pub fn add_issue_field(&self, field: AddIssueField) -> Option<&str> {
+        self.add_issue.as_ref().map(|flow| match field {
+            AddIssueField::Title => flow.title.as_str(),
+            AddIssueField::Description => flow.description.as_str(),
+        })
+    }
+
+    pub fn finish_add_issue(&mut self) {
+        self.add_issue = None;
+    }
+
     pub fn status_message(&self) -> Option<&str> {
         self.status_message.as_deref()
     }
@@ -143,8 +251,12 @@ impl App {
         self.status_message = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.confirming_close = None;
+            self.add_issue = None;
             self.edit_key_started = None;
             return Action::Quit;
+        }
+        if self.add_issue.is_some() {
+            return self.handle_add_issue_key(key);
         }
         if self.confirming_close.is_some() {
             return match key.code {
@@ -209,6 +321,7 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(),
             KeyCode::Enter => self.open_selected_issue(),
             KeyCode::Char('x') => self.start_close_confirmation(),
+            KeyCode::Char('+') => self.start_add_issue(),
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             _ => {}
         }
@@ -295,12 +408,99 @@ impl App {
             KeyCode::Char('x') if self.can_close_current_issue() => {
                 self.start_close_confirmation();
             }
+            KeyCode::Char('+') if self.current_detail_issue().is_some() => self.start_add_issue(),
             KeyCode::Backspace => {
                 self.history.pop();
             }
             KeyCode::Esc => self.history.clear(),
             KeyCode::Char('q') => return Action::Quit,
             _ => {}
+        }
+        Action::None
+    }
+
+    fn handle_add_issue_key(&mut self, key: KeyEvent) -> Action {
+        let Some(flow) = self.add_issue.as_mut() else {
+            return Action::None;
+        };
+
+        if flow.confirming_cancel {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.add_issue = None;
+                    Action::None
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    flow.confirming_cancel = false;
+                    Action::None
+                }
+                _ => Action::None,
+            };
+        }
+
+        if key.code == KeyCode::Esc {
+            flow.confirming_cancel = true;
+            return Action::None;
+        }
+
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match flow.step {
+            AddIssueStep::Title => match key.code {
+                KeyCode::Enter if !flow.title.trim().is_empty() => {
+                    flow.step = AddIssueStep::Description;
+                }
+                KeyCode::Backspace => {
+                    flow.title.pop();
+                }
+                KeyCode::Char('e') if plain && flow.title.is_empty() => {
+                    return Action::EditAddIssue(AddIssueField::Title);
+                }
+                KeyCode::Char(character) if plain => flow.title.push(character),
+                _ => {}
+            },
+            AddIssueStep::Description => match key.code {
+                KeyCode::Enter => flow.step = AddIssueStep::IssueType,
+                KeyCode::Backspace => {
+                    flow.description.pop();
+                }
+                KeyCode::Char('e') if plain && flow.description.is_empty() => {
+                    return Action::EditAddIssue(AddIssueField::Description);
+                }
+                KeyCode::Char(character) if plain => flow.description.push(character),
+                _ => {}
+            },
+            AddIssueStep::IssueType => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    flow.issue_type_index = (flow.issue_type_index + 1).min(ISSUE_TYPES.len() - 1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    flow.issue_type_index = flow.issue_type_index.saturating_sub(1);
+                }
+                KeyCode::Char('g') | KeyCode::Home => flow.issue_type_index = 0,
+                KeyCode::Char('G') | KeyCode::End => {
+                    flow.issue_type_index = ISSUE_TYPES.len() - 1;
+                }
+                KeyCode::Enter => flow.step = AddIssueStep::Priority,
+                KeyCode::Backspace => flow.step = AddIssueStep::Description,
+                _ => {}
+            },
+            AddIssueStep::Priority => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    flow.priority_index = (flow.priority_index + 1).min(PRIORITIES.len() - 1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    flow.priority_index = flow.priority_index.saturating_sub(1);
+                }
+                KeyCode::Char('g') | KeyCode::Home => flow.priority_index = 0,
+                KeyCode::Char('G') | KeyCode::End => {
+                    flow.priority_index = PRIORITIES.len() - 1;
+                }
+                KeyCode::Enter => return Action::CreateIssue(flow.draft()),
+                KeyCode::Backspace => flow.step = AddIssueStep::IssueType,
+                _ => {}
+            },
         }
         Action::None
     }
@@ -341,9 +541,30 @@ impl App {
         self.confirming_close = issue_id;
     }
 
+    fn start_add_issue(&mut self) {
+        let parent_id = match self.screen() {
+            Screen::Tree => self.current_tree_issue(),
+            Screen::Detail => self.current_detail_issue(),
+        }
+        .map(|issue| issue.id.clone());
+        if let Some(parent_id) = parent_id {
+            self.edit_key_started = None;
+            self.add_issue = Some(AddIssueFlow {
+                parent_id,
+                title: String::new(),
+                description: String::new(),
+                step: AddIssueStep::Title,
+                issue_type_index: 0,
+                priority_index: 1,
+                confirming_cancel: false,
+            });
+        }
+    }
+
     pub fn return_to_tree(&mut self) {
         self.history.clear();
         self.confirming_close = None;
+        self.add_issue = None;
         self.edit_key_started = None;
     }
 
@@ -740,6 +961,91 @@ mod tests {
         app.handle_key(key(KeyCode::Backspace));
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
         app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::Tree);
+    }
+
+    #[test]
+    fn plus_starts_add_issue_at_the_selected_tree_location() {
+        let mut app = App::new(graph());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('+'))), Action::None);
+        let flow = app.add_issue_flow().unwrap();
+        assert_eq!(flow.parent_id, "a");
+        assert_eq!(flow.step, AddIssueStep::Title);
+        assert_eq!(flow.issue_type(), "task");
+        assert_eq!(flow.priority(), 1);
+    }
+
+    #[test]
+    fn plus_starts_add_issue_at_the_current_task_view_location() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('+')));
+
+        assert_eq!(app.add_issue_flow().unwrap().parent_id, "b");
+    }
+
+    #[test]
+    fn add_issue_flow_collects_fields_and_emits_a_create_action() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Char('+')));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Action::EditAddIssue(AddIssueField::Title)
+        );
+        app.set_add_issue_field(AddIssueField::Title, "A new child\n".into());
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.add_issue_flow().unwrap().step,
+            AddIssueStep::Description
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Action::EditAddIssue(AddIssueField::Description)
+        );
+        app.set_add_issue_field(AddIssueField::Description, "Some detail\n".into());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::CreateIssue(AddIssueDraft {
+                parent_id: "a".into(),
+                title: "A new child".into(),
+                description: "Some detail".into(),
+                issue_type: "bug".into(),
+                priority: 1,
+            })
+        );
+        assert!(
+            app.add_issue_flow().is_some(),
+            "failed creates can be retried"
+        );
+    }
+
+    #[test]
+    fn escape_confirms_before_discarding_add_issue_progress() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Char('+')));
+        app.handle_key(key(KeyCode::Char('F')));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app
+            .add_issue_flow()
+            .is_some_and(AddIssueFlow::is_confirming_cancel));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app
+            .add_issue_flow()
+            .is_some_and(AddIssueFlow::is_confirming_cancel));
+        assert_eq!(app.add_issue_flow().unwrap().title, "F");
+
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.add_issue_flow().is_none());
         assert_eq!(app.screen(), Screen::Tree);
     }
 
