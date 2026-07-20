@@ -2,7 +2,7 @@
 
 `be` is a dead simple, fast terminal explorer for [beads](https://github.com/gastownhall/beads) issue graphs. It asks the installed `bd` command for JSON data, so it uses the same workspace discovery and database semantics as the main beads CLI.
 
-https://github.com/user-attachments/assets/0b5e8a19-5941-4f8e-885a-9a6cc8f0e3da
+https://github.com/user-attachments/assets/206a634c-8ced-4588-ae28-14b8174a9a3a
 
 ## Install
 
@@ -38,4 +38,4 @@ Press `+` to create a child issue at the current location. The flow collects a t
 
 ## Planned improvements
 
-- Quick edit issue status from task view
+- Status/priority update menus
