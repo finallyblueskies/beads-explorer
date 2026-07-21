@@ -23,19 +23,20 @@ Then run `be` anywhere that `bd list` works. The tree shows issues whose status 
 | `j` / `k`, arrows | Move | Select dependency |
 | `h` / `l`, Left / Right | Fold / expand | — |
 | `Tab` | Toggle fold | — |
-| `Enter` | Open task | Open dependency |
+| `Enter` | Open task (`+ Create New` entry: add a top-level issue) | Open dependency |
 | `+` | Add a child to the selected issue | Add a child to this issue |
-| `e` | — | Edit description in `$EDITOR` |
+| `e` / `ee` | Edit description in `$EDITOR` | Edit description in `$EDITOR` |
+| `et` | Edit title in `$EDITOR` | Edit title in `$EDITOR` |
+| `s` | Set status of the selected issue | Set status of this issue |
+| `p` | Set priority of the selected issue | Set priority of this issue |
 | `x`, then `y` | Close selected issue after confirmation | Close issue after confirmation |
 | `/` | Fuzzy go-to by issue ID | — |
 | `Backspace` | — | Previous task/tree |
 | `Esc` | Quit | Return to tree |
 | `q` | Quit | Quit |
 
+Editing keys are the same everywhere: they act on the issue selected in the tree or on the issue open in Task View. `s` and `p` open a small menu preselecting the current status/priority — `j`/`k` to choose, `Enter` to apply via `bd update`, `Esc` to cancel.
+
 While go-to is open, type any part of an issue ID; matching is case-insensitive and fuzzy, so the characters only need to appear in order. Search filters only the rows currently visible in the tree—children of collapsed issues are excluded. Use the arrow keys to select a match, `Enter` to open it, or `Esc` to cancel.
 
-Press `+` to create a child issue at the current location. The flow collects a title, description, issue type, and priority (P1 by default). Type text directly or press `e` on an empty title/description to use `$VISUAL`/`$EDITOR`; use `j`/`k` or the arrow keys for selections. `Esc` can cancel from any step after confirmation.
-
-## Planned improvements
-
-- Status/priority update menus
+Press `+` to create a child issue at the current location, or press `Enter` on the `+ Create New` entry at the top of the tree to create a top-level issue (also available when the database is empty). The flow collects a title, description, issue type, and priority (P1 by default). Type text directly or press `e` on an empty title/description to use `$VISUAL`/`$EDITOR`; use `j`/`k` or the arrow keys for selections. `Esc` can cancel from any step after confirmation.

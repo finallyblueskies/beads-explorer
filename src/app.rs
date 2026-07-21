@@ -7,6 +7,7 @@ const EDIT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub const ISSUE_TYPES: [&str; 6] = ["task", "bug", "feature", "epic", "chore", "decision"];
 pub const PRIORITIES: [i32; 5] = [0, 1, 2, 3, 4];
+pub const STATUSES: [&str; 5] = ["open", "in_progress", "blocked", "deferred", "closed"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeRow {
@@ -14,6 +15,22 @@ pub struct TreeRow {
     pub path: Vec<String>,
     pub prefix: String,
     pub cycle: bool,
+}
+
+impl TreeRow {
+    /// The synthetic first row of the tree; Enter on it creates a top-level issue.
+    fn create_entry() -> Self {
+        Self {
+            issue_id: String::new(),
+            path: Vec::new(),
+            prefix: String::new(),
+            cycle: false,
+        }
+    }
+
+    pub fn is_create_entry(&self) -> bool {
+        self.path.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,9 +71,38 @@ pub enum AddIssueField {
     Description,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerKind {
+    Status,
+    Priority,
+}
+
+/// A floating single-choice menu for updating the current issue in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picker {
+    pub kind: PickerKind,
+    pub issue_id: String,
+    pub index: usize,
+}
+
+impl Picker {
+    pub fn options(&self) -> Vec<String> {
+        match self.kind {
+            PickerKind::Status => STATUSES
+                .iter()
+                .map(|status| (*status).to_string())
+                .collect(),
+            PickerKind::Priority => PRIORITIES
+                .iter()
+                .map(|priority| format!("P{priority}"))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddIssueFlow {
-    pub parent_id: String,
+    pub parent_id: Option<String>,
     pub title: String,
     pub description: String,
     pub step: AddIssueStep,
@@ -97,6 +143,8 @@ pub enum Action {
     Edit(EditField),
     EditAddIssue(AddIssueField),
     CreateIssue(AddIssueDraft),
+    SetStatus(String, &'static str),
+    SetPriority(String, i32),
 }
 
 /// The mutually exclusive input modes layered over the tree/detail screens.
@@ -109,6 +157,7 @@ enum Mode {
     },
     ConfirmClose(String),
     AddIssue(AddIssueFlow),
+    Picker(Picker),
 }
 
 pub struct App {
@@ -141,6 +190,8 @@ impl App {
             status_message: None,
         };
         app.rebuild_rows();
+        // Start on the first issue rather than the synthetic create entry.
+        app.cursor = 1.min(app.rows.len() - 1);
         app
     }
 
@@ -171,6 +222,15 @@ impl App {
             .and_then(|frame| self.graph.issue(&frame.issue_id))
     }
 
+    /// The issue the edit/status/priority/close keys act on: the selected tree
+    /// row or the issue in the task view, depending on the visible screen.
+    pub fn current_issue(&self) -> Option<&Issue> {
+        match self.screen() {
+            Screen::Tree => self.current_tree_issue(),
+            Screen::Detail => self.current_detail_issue(),
+        }
+    }
+
     pub fn detail_frame(&self) -> Option<&DetailFrame> {
         self.history.last()
     }
@@ -193,6 +253,13 @@ impl App {
     pub fn add_issue_flow(&self) -> Option<&AddIssueFlow> {
         match &self.mode {
             Mode::AddIssue(flow) => Some(flow),
+            _ => None,
+        }
+    }
+
+    pub fn picker(&self) -> Option<&Picker> {
+        match &self.mode {
+            Mode::Picker(picker) => Some(picker),
             _ => None,
         }
     }
@@ -261,6 +328,7 @@ impl App {
             Mode::AddIssue(_) => self.handle_add_issue_key(key),
             Mode::ConfirmClose(_) => self.handle_confirm_close_key(key),
             Mode::Search { .. } => self.handle_search_key(key),
+            Mode::Picker(_) => self.handle_picker_key(key),
             Mode::Normal => match self.screen() {
                 Screen::Tree => self.handle_tree_key(key),
                 Screen::Detail => self.handle_detail_key(key),
@@ -299,17 +367,33 @@ impl App {
         }
     }
 
+    /// Resolves a pending `e` chord: `et` edits the title, `ee` (or the
+    /// timeout) edits the description, anything else cancels the chord and is
+    /// handled normally by the caller.
+    fn resolve_edit_chord(&mut self, key: &KeyEvent) -> Option<Action> {
+        let started = self.edit_key_started.take()?;
+        if started.elapsed() >= EDIT_SEQUENCE_TIMEOUT {
+            return Some(Action::Edit(EditField::Description));
+        }
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if plain && key.code == KeyCode::Char('t') {
+            return Some(Action::Edit(EditField::Title));
+        }
+        if plain && key.code == KeyCode::Char('e') {
+            return Some(Action::Edit(EditField::Description));
+        }
+        None
+    }
+
     fn handle_tree_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(action) = self.resolve_edit_chord(&key) {
+            return action;
+        }
         if key.code == KeyCode::Char('/') {
             self.start_search();
             return Action::None;
-        }
-
-        if self.rows.is_empty() {
-            return match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-                _ => Action::None,
-            };
         }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -325,17 +409,28 @@ impl App {
             KeyCode::Tab => self.toggle(),
             KeyCode::Char('l') | KeyCode::Right => self.expand_or_enter(),
             KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(),
+            KeyCode::Enter if self.selected_row_is_create_entry() => self.start_add_issue(None),
             KeyCode::Enter => self.open_selected_issue(),
-            KeyCode::Char('e') => {
-                self.open_selected_issue();
-                return Action::Edit(EditField::Description);
+            KeyCode::Char('e') if self.current_tree_issue().is_some() => {
+                self.edit_key_started = Some(Instant::now());
             }
+            KeyCode::Char('s') => self.start_picker(PickerKind::Status),
+            KeyCode::Char('p') => self.start_picker(PickerKind::Priority),
             KeyCode::Char('x') => self.start_close_confirmation(),
-            KeyCode::Char('+') => self.start_add_issue(),
+            KeyCode::Char('+') => {
+                let parent_id = self.current_tree_issue().map(|issue| issue.id.clone());
+                self.start_add_issue(parent_id);
+            }
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             _ => {}
         }
         Action::None
+    }
+
+    fn selected_row_is_create_entry(&self) -> bool {
+        self.rows
+            .get(self.cursor)
+            .is_some_and(TreeRow::is_create_entry)
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Action {
@@ -378,20 +473,8 @@ impl App {
     }
 
     fn handle_detail_key(&mut self, key: KeyEvent) -> Action {
-        if let Some(started) = self.edit_key_started.take() {
-            let plain = !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-            if started.elapsed() >= EDIT_SEQUENCE_TIMEOUT {
-                return Action::Edit(EditField::Description);
-            }
-            if plain && key.code == KeyCode::Char('t') {
-                return Action::Edit(EditField::Title);
-            }
-            if plain && key.code == KeyCode::Char('e') {
-                return Action::Edit(EditField::Description);
-            }
-            // Any other key cancels the sequence and is handled normally below.
+        if let Some(action) = self.resolve_edit_chord(&key) {
+            return action;
         }
 
         match key.code {
@@ -415,10 +498,15 @@ impl App {
             KeyCode::Char('e') if self.current_detail_issue().is_some() => {
                 self.edit_key_started = Some(Instant::now());
             }
+            KeyCode::Char('s') => self.start_picker(PickerKind::Status),
+            KeyCode::Char('p') => self.start_picker(PickerKind::Priority),
             KeyCode::Char('x') if self.can_close_current_issue() => {
                 self.start_close_confirmation();
             }
-            KeyCode::Char('+') if self.current_detail_issue().is_some() => self.start_add_issue(),
+            KeyCode::Char('+') if self.current_detail_issue().is_some() => {
+                let parent_id = self.current_detail_issue().map(|issue| issue.id.clone());
+                self.start_add_issue(parent_id);
+            }
             KeyCode::Backspace => {
                 self.history.pop();
             }
@@ -510,6 +598,58 @@ impl App {
         Action::None
     }
 
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::Picker(picker) = &mut self.mode else {
+            return Action::None;
+        };
+        let last = picker.options().len() - 1;
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => picker.index = (picker.index + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => picker.index = picker.index.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => picker.index = 0,
+            KeyCode::Char('G') | KeyCode::End => picker.index = last,
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                let Mode::Picker(picker) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+                    return Action::None;
+                };
+                return match picker.kind {
+                    PickerKind::Status => {
+                        Action::SetStatus(picker.issue_id, STATUSES[picker.index])
+                    }
+                    PickerKind::Priority => {
+                        Action::SetPriority(picker.issue_id, PRIORITIES[picker.index])
+                    }
+                };
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn start_picker(&mut self, kind: PickerKind) {
+        let Some(issue) = self.current_issue() else {
+            return;
+        };
+        let index = match kind {
+            PickerKind::Status => STATUSES
+                .iter()
+                .position(|status| *status == issue.status)
+                .unwrap_or(0),
+            PickerKind::Priority => PRIORITIES
+                .iter()
+                .position(|priority| *priority == issue.priority)
+                .unwrap_or(1),
+        };
+        let issue_id = issue.id.clone();
+        self.edit_key_started = None;
+        self.mode = Mode::Picker(Picker {
+            kind,
+            issue_id,
+            index,
+        });
+    }
+
     fn move_cursor(&mut self, delta: isize) {
         let last = self.rows.len().saturating_sub(1) as isize;
         self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
@@ -528,6 +668,9 @@ impl App {
 
     fn open_selected_issue(&mut self) {
         if let Some(row) = self.rows.get(self.cursor) {
+            if row.is_create_entry() {
+                return;
+            }
             self.history.push(DetailFrame {
                 issue_id: row.issue_id.clone(),
                 dependency_cursor: 0,
@@ -537,35 +680,26 @@ impl App {
     }
 
     fn start_close_confirmation(&mut self) {
-        let issue_id = match self.screen() {
-            Screen::Tree => self.current_tree_issue(),
-            Screen::Detail => self.current_detail_issue(),
-        }
-        .filter(|issue| self.graph.is_listed(&issue.id))
-        .map(|issue| issue.id.clone());
+        let issue_id = self
+            .current_issue()
+            .filter(|issue| self.graph.is_listed(&issue.id))
+            .map(|issue| issue.id.clone());
         if let Some(issue_id) = issue_id {
             self.mode = Mode::ConfirmClose(issue_id);
         }
     }
 
-    fn start_add_issue(&mut self) {
-        let parent_id = match self.screen() {
-            Screen::Tree => self.current_tree_issue(),
-            Screen::Detail => self.current_detail_issue(),
-        }
-        .map(|issue| issue.id.clone());
-        if let Some(parent_id) = parent_id {
-            self.edit_key_started = None;
-            self.mode = Mode::AddIssue(AddIssueFlow {
-                parent_id,
-                title: String::new(),
-                description: String::new(),
-                step: AddIssueStep::Title,
-                issue_type_index: 0,
-                priority_index: 1,
-                confirming_cancel: false,
-            });
-        }
+    fn start_add_issue(&mut self, parent_id: Option<String>) {
+        self.edit_key_started = None;
+        self.mode = Mode::AddIssue(AddIssueFlow {
+            parent_id,
+            title: String::new(),
+            description: String::new(),
+            step: AddIssueStep::Title,
+            issue_type_index: 0,
+            priority_index: 1,
+            confirming_cancel: false,
+        });
     }
 
     pub fn return_to_tree(&mut self) {
@@ -711,7 +845,7 @@ impl App {
         self.rows = self
             .tree_rows
             .iter()
-            .filter(|row| fuzzy_match(&row.issue_id, query))
+            .filter(|row| !row.is_create_entry() && fuzzy_match(&row.issue_id, query))
             .cloned()
             .collect();
         self.cursor = 0;
@@ -836,7 +970,7 @@ impl App {
             }
         }
 
-        let mut rows = Vec::new();
+        let mut rows = vec![TreeRow::create_entry()];
         let mut restored_expansions = HashSet::new();
         for root in self.graph.roots() {
             let path = vec![root.clone()];
@@ -926,20 +1060,29 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// The tree rows without the synthetic create entry.
+    fn issue_ids(app: &App) -> Vec<&str> {
+        app.rows
+            .iter()
+            .filter(|row| !row.is_create_entry())
+            .map(|row| row.issue_id.as_str())
+            .collect()
+    }
+
     #[test]
     fn tree_starts_at_first_level_and_expands_like_treec() {
         let mut app = App::new(graph());
-        assert_eq!(app.rows.len(), 1);
-        assert_eq!(app.rows[0].issue_id, "a");
+        assert!(app.rows[0].is_create_entry());
+        assert_eq!(issue_ids(&app), ["a"]);
+        assert_eq!(app.cursor, 1, "cursor starts on the first issue");
 
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.rows.len(), 2);
-        assert_eq!(app.rows[1].issue_id, "b");
+        assert_eq!(issue_ids(&app), ["a", "b"]);
 
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.cursor, 2);
         app.handle_key(key(KeyCode::Char('h')));
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.cursor, 1);
     }
 
     #[test]
@@ -959,12 +1102,10 @@ mod tests {
         };
         let mut app = App::new(IssueGraph::new(vec![child, parent], vec![]));
 
-        assert_eq!(app.rows.len(), 1);
-        assert_eq!(app.rows[0].issue_id, "8gda");
+        assert_eq!(issue_ids(&app), ["8gda"]);
 
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.rows.len(), 2);
-        assert_eq!(app.rows[1].issue_id, "hmb2");
+        assert_eq!(issue_ids(&app), ["8gda", "hmb2"]);
     }
 
     #[test]
@@ -988,7 +1129,7 @@ mod tests {
 
         assert_eq!(app.handle_key(key(KeyCode::Char('+'))), Action::None);
         let flow = app.add_issue_flow().unwrap();
-        assert_eq!(flow.parent_id, "a");
+        assert_eq!(flow.parent_id.as_deref(), Some("a"));
         assert_eq!(flow.step, AddIssueStep::Title);
         assert_eq!(flow.issue_type(), "task");
         assert_eq!(flow.priority(), 1);
@@ -1002,7 +1143,10 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('+')));
 
-        assert_eq!(app.add_issue_flow().unwrap().parent_id, "b");
+        assert_eq!(
+            app.add_issue_flow().unwrap().parent_id.as_deref(),
+            Some("b")
+        );
     }
 
     #[test]
@@ -1032,7 +1176,7 @@ mod tests {
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Action::CreateIssue(AddIssueDraft {
-                parent_id: "a".into(),
+                parent_id: Some("a".into()),
                 title: "A new child".into(),
                 description: "Some detail".into(),
                 issue_type: "bug".into(),
@@ -1081,15 +1225,29 @@ mod tests {
     }
 
     #[test]
-    fn e_in_tree_requests_description_edit_for_the_selected_issue() {
+    fn e_in_tree_requests_description_edit_without_leaving_the_tree() {
         let mut app = App::new(graph());
 
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
         assert_eq!(
-            app.handle_key(key(KeyCode::Char('e'))),
+            app.flush_pending_key(),
             Action::Edit(EditField::Description)
         );
-        assert_eq!(app.current_detail_issue().unwrap().id, "a");
-        assert_eq!(app.screen(), Screen::Detail);
+        assert_eq!(app.screen(), Screen::Tree);
+        assert_eq!(app.current_issue().unwrap().id, "a");
+    }
+
+    #[test]
+    fn e_then_t_in_tree_requests_title_edit_like_the_task_view() {
+        let mut app = App::new(graph());
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('t'))),
+            Action::Edit(EditField::Title)
+        );
+        assert_eq!(app.screen(), Screen::Tree);
+        assert_eq!(app.current_issue().unwrap().id, "a");
     }
 
     #[test]
@@ -1141,7 +1299,7 @@ mod tests {
     fn refresh_forgets_expansion_of_issues_that_left_the_graph() {
         let mut app = App::new(graph());
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.rows.len(), 2);
+        assert_eq!(issue_ids(&app), ["a", "b"]);
 
         app.refresh_graph(IssueGraph::new(
             vec![Issue {
@@ -1152,8 +1310,8 @@ mod tests {
         ));
         app.refresh_graph(graph());
 
-        assert_eq!(app.rows.len(), 1, "a must come back collapsed");
-        assert!(!app.row_is_expanded(&app.rows[0]));
+        assert_eq!(issue_ids(&app), ["a"], "a must come back collapsed");
+        assert!(!app.row_is_expanded(&app.rows[1]));
     }
 
     #[test]
@@ -1252,15 +1410,9 @@ mod tests {
         app.handle_key(key(KeyCode::Char('l')));
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(
-            app.rows
-                .iter()
-                .map(|row| row.issue_id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "b", "c"]
-        );
+        assert_eq!(issue_ids(&app), ["a", "b", "c"]);
 
-        app.cursor = 0;
+        app.cursor = 1;
         app.scroll = 0;
         app.handle_key(key(KeyCode::Char('x')));
         assert_eq!(
@@ -1289,15 +1441,9 @@ mod tests {
             vec![],
         ));
 
-        assert_eq!(
-            app.rows
-                .iter()
-                .map(|row| row.issue_id.as_str())
-                .collect::<Vec<_>>(),
-            ["b", "c"]
-        );
+        assert_eq!(issue_ids(&app), ["b", "c"]);
         assert_eq!(app.current_tree_issue().unwrap().id, "b");
-        assert!(app.row_is_expanded(&app.rows[0]));
+        assert!(app.row_is_expanded(&app.rows[1]));
         assert_eq!(app.scroll, 0);
     }
 
@@ -1342,18 +1488,12 @@ mod tests {
         app.handle_key(key(KeyCode::Char('l'))); // expand a
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Char('l'))); // expand c under a
-        app.cursor = 3;
+        app.cursor = 4;
         app.handle_key(key(KeyCode::Char('l'))); // expand d, but not c under d
 
         app.refresh_graph(shared_graph());
 
-        assert_eq!(
-            app.rows
-                .iter()
-                .map(|row| row.issue_id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "c", "e", "d", "c"]
-        );
+        assert_eq!(issue_ids(&app), ["a", "c", "e", "d", "c"]);
         assert_eq!(app.current_tree_issue().unwrap().id, "d");
     }
 
@@ -1375,7 +1515,7 @@ mod tests {
         ));
 
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.rows.len(), 1);
+        assert_eq!(issue_ids(&app), ["open"]);
 
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.selected_dependency().unwrap().id, "closed");
@@ -1418,7 +1558,103 @@ mod tests {
 
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.search_query(), None);
-        assert_eq!(app.rows[0].issue_id, "a");
+        assert_eq!(app.current_tree_issue().unwrap().id, "a");
+    }
+
+    #[test]
+    fn enter_on_the_create_entry_starts_a_top_level_add_issue() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Char('g')));
+        assert!(app.rows[app.cursor].is_create_entry());
+
+        app.handle_key(key(KeyCode::Enter));
+
+        let flow = app.add_issue_flow().unwrap();
+        assert_eq!(flow.parent_id, None);
+        assert_eq!(flow.step, AddIssueStep::Title);
+    }
+
+    #[test]
+    fn create_entry_is_available_even_when_the_tree_is_empty() {
+        let mut app = App::new(IssueGraph::new(vec![], vec![]));
+        assert_eq!(app.rows.len(), 1);
+        assert!(app.rows[0].is_create_entry());
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.add_issue_flow().unwrap().parent_id, None);
+    }
+
+    #[test]
+    fn create_entry_ignores_issue_keys_and_stays_out_of_search() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Char('g')));
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Action::None);
+        assert!(!app.is_confirming_close());
+        assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
+        assert_eq!(app.flush_pending_key(), Action::None);
+        app.handle_key(key(KeyCode::Char('s')));
+        assert!(app.picker().is_none());
+
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.rows.is_empty(), "'c' must not match the create entry");
+    }
+
+    #[test]
+    fn s_opens_a_status_picker_preselecting_the_current_status() {
+        let mut app = App::new(IssueGraph::new(
+            vec![Issue {
+                id: "a".into(),
+                status: "in_progress".into(),
+                ..Issue::default()
+            }],
+            vec![],
+        ));
+
+        app.handle_key(key(KeyCode::Char('s')));
+        let picker = app.picker().unwrap();
+        assert_eq!(picker.kind, PickerKind::Status);
+        assert_eq!(picker.issue_id, "a");
+        assert_eq!(STATUSES[picker.index], "in_progress");
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::SetStatus("a".into(), "blocked")
+        );
+        assert!(app.picker().is_none());
+        assert_eq!(app.screen(), Screen::Tree);
+    }
+
+    #[test]
+    fn p_opens_a_priority_picker_in_the_task_view_too() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('p')));
+        let picker = app.picker().unwrap();
+        assert_eq!(picker.kind, PickerKind::Priority);
+        assert_eq!(PRIORITIES[picker.index], 0);
+
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::SetPriority("a".into(), 2)
+        );
+        assert_eq!(app.screen(), Screen::Detail, "picker returns to task view");
+    }
+
+    #[test]
+    fn escape_cancels_a_picker_without_an_action() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Char('s')));
+        assert!(app.picker().is_some());
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.picker().is_none());
+        assert_eq!(app.screen(), Screen::Tree);
     }
 
     #[test]

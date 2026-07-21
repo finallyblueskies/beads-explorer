@@ -1,4 +1,6 @@
-use crate::app::{AddIssueFlow, AddIssueStep, App, Screen, ISSUE_TYPES, PRIORITIES};
+use crate::app::{
+    AddIssueFlow, AddIssueStep, App, Picker, PickerKind, Screen, ISSUE_TYPES, PRIORITIES,
+};
 use crate::model::Issue;
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
@@ -46,6 +48,9 @@ pub fn draw(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io:
         if flow.is_confirming_cancel() {
             draw_add_issue_cancel_confirmation(out, width, height)?;
         }
+    }
+    if let Some(picker) = app.picker() {
+        draw_picker(out, width, height, picker)?;
     }
     if let Some(issue_id) = app.closing_issue_id() {
         draw_close_confirmation(out, width, height, issue_id)?;
@@ -108,6 +113,10 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         for line in 0..visible {
             let position = app.scroll + line;
             let row = &app.rows[position];
+            if row.is_create_entry() {
+                draw_create_entry(out, line as u16 + 1, width, position == app.cursor)?;
+                continue;
+            }
             let Some(issue) = app.graph.issue(&row.issue_id) else {
                 queue!(
                     out,
@@ -163,7 +172,7 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         )
     } else {
         format!(
-            "{} issue{} · + add child · / go to · j/k move · h/l fold · Enter open · e edit · x close · q quit",
+            "{} issue{} · + add child · / go to · j/k move · h/l fold · Enter open · e edit · s status · p priority · x close · q quit",
             app.graph.len(),
             if app.graph.len() == 1 { "" } else { "s" }
         )
@@ -244,10 +253,10 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
     }
 
     let footer = if app.can_close_current_issue() {
-        "+ add child · j/k dependency · Enter open · e description · et title · x close · Backspace back · Esc tree · q quit"
+        "+ add child · j/k dependency · Enter open · e edit · et title · s status · p priority · x close · Backspace back · Esc tree · q quit"
             .to_string()
     } else {
-        "+ add child · j/k dependency · Enter open · e description · et title · Backspace back · Esc tree · q quit"
+        "+ add child · j/k dependency · Enter open · e edit · et title · s status · p priority · Backspace back · Esc tree · q quit"
             .to_string()
     };
     queue!(
@@ -279,6 +288,43 @@ fn draw_status_line(
     )
 }
 
+fn draw_create_entry(out: &mut impl Write, y: u16, width: usize, selected: bool) -> io::Result<()> {
+    queue!(out, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
+    if selected {
+        queue!(out, SetBackgroundColor(HIGHLIGHT_BACKGROUND))?;
+    }
+    queue!(
+        out,
+        SetForegroundColor(Color::Green),
+        SetAttribute(Attribute::Bold),
+        Print(pad("+ Create New", width)),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
+    )
+}
+
+fn draw_picker(out: &mut impl Write, width: u16, height: u16, picker: &Picker) -> io::Result<()> {
+    let title = match picker.kind {
+        PickerKind::Status => format!(" Set status · {} ", picker.issue_id),
+        PickerKind::Priority => format!(" Set priority · {} ", picker.issue_id),
+    };
+    let mut lines: Vec<String> = picker
+        .options()
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            format!(
+                "{} {}",
+                if index == picker.index { "›" } else { " " },
+                option
+            )
+        })
+        .collect();
+    lines.push(String::new());
+    lines.push("j/k or ↑/↓ select · Enter apply · Esc cancel".to_string());
+    draw_floating_modal(out, width, height, &title, &lines)
+}
+
 fn draw_close_confirmation(
     out: &mut impl Write,
     width: u16,
@@ -305,7 +351,11 @@ fn draw_add_issue(
     flow: &AddIssueFlow,
     status: Option<&str>,
 ) -> io::Result<()> {
-    let mut lines = vec![format!("Parent: {}", flow.parent_id), String::new()];
+    let parent = flow
+        .parent_id
+        .as_deref()
+        .unwrap_or("none · new top-level issue");
+    let mut lines = vec![format!("Parent: {parent}"), String::new()];
     match flow.step {
         AddIssueStep::Title => {
             lines.push("Title".to_string());
@@ -360,13 +410,12 @@ fn draw_add_issue(
         lines.push(String::new());
         lines.push(format!("Error: {status}"));
     }
-    draw_floating_modal(
-        out,
-        width,
-        height,
-        &format!(" Add child issue · {}/4 ", flow.step.number()),
-        &lines,
-    )
+    let title = if flow.parent_id.is_some() {
+        format!(" Add child issue · {}/4 ", flow.step.number())
+    } else {
+        format!(" Add issue · {}/4 ", flow.step.number())
+    };
+    draw_floating_modal(out, width, height, &title, &lines)
 }
 
 fn draw_add_issue_cancel_confirmation(
@@ -883,6 +932,32 @@ mod tests {
         let rendered = String::from_utf8_lossy(&output);
         assert!(rendered.contains("Discard new issue?"));
         assert!(rendered.contains("[y] Discard"));
+    }
+
+    #[test]
+    fn tree_renders_the_create_entry_and_status_picker() {
+        let mut app = App::new(IssueGraph::new(
+            vec![Issue {
+                id: "task-1".into(),
+                title: "A task".into(),
+                status: "open".into(),
+                ..Issue::default()
+            }],
+            vec![],
+        ));
+
+        let mut output = Vec::new();
+        draw(&mut app, &mut output, 80, 20).unwrap();
+        let rendered = String::from_utf8_lossy(&output).to_string();
+        assert!(rendered.contains("+ Create New"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        output.clear();
+        draw(&mut app, &mut output, 80, 24).unwrap();
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(rendered.contains("Set status · task-1"));
+        assert!(rendered.contains("› open"));
+        assert!(rendered.contains("Enter apply"));
     }
 
     #[test]

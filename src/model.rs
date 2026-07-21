@@ -50,10 +50,11 @@ pub enum EditField {
     Description,
 }
 
-/// Everything `bd create` needs for a new child issue.
+/// Everything `bd create` needs for a new issue; `parent_id` is `None` for a
+/// top-level issue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddIssueDraft {
-    pub parent_id: String,
+    pub parent_id: Option<String>,
     pub title: String,
     pub description: String,
     pub issue_type: String,
@@ -332,24 +333,40 @@ impl Bd {
             .map(|_| ())
     }
 
+    pub fn set_status(&self, issue_id: &str, status: &str) -> io::Result<()> {
+        self.run(
+            "update",
+            &mut self.command(&["update", issue_id, "--status", status]),
+        )
+        .map(|_| ())
+    }
+
+    pub fn set_priority(&self, issue_id: &str, priority: i32) -> io::Result<()> {
+        self.run(
+            "update",
+            &mut self.command(&["update", issue_id, "--priority", &format!("P{priority}")]),
+        )
+        .map(|_| ())
+    }
+
     pub fn create_issue(&self, draft: &AddIssueDraft) -> io::Result<String> {
         let priority = format!("P{}", draft.priority);
-        let output = self.run(
+        let mut args = vec![
             "create",
-            &mut self.command(&[
-                "create",
-                &draft.title,
-                "--description",
-                &draft.description,
-                "--type",
-                &draft.issue_type,
-                "--priority",
-                &priority,
-                "--parent",
-                &draft.parent_id,
-                "--silent",
-            ]),
-        )?;
+            draft.title.as_str(),
+            "--description",
+            draft.description.as_str(),
+            "--type",
+            draft.issue_type.as_str(),
+            "--priority",
+            priority.as_str(),
+        ];
+        if let Some(parent_id) = &draft.parent_id {
+            args.push("--parent");
+            args.push(parent_id);
+        }
+        args.push("--silent");
+        let output = self.run("create", &mut self.command(&args))?;
         let issue_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if issue_id.is_empty() {
             Err(io::Error::new(
@@ -566,7 +583,7 @@ mod tests {
         );
         let issue_id = bd
             .create_issue(&AddIssueDraft {
-                parent_id: "parent-1".into(),
+                parent_id: Some("parent-1".into()),
                 title: "Child title".into(),
                 description: "Body text".into(),
                 issue_type: "feature".into(),
@@ -594,6 +611,100 @@ mod tests {
                 "--silent",
                 "--db",
                 "/tmp/example.db",
+            ]
+        );
+
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_file(arguments);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_issue_without_parent_omits_the_parent_flag() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir();
+        let script = directory.join(format!("be-fake-bd-root-{}-{nonce}", std::process::id()));
+        let arguments = directory.join(format!(
+            "be-fake-bd-root-args-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'root-1\\n'\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let issue_id = Bd::new(script.clone().into_os_string(), None)
+            .create_issue(&AddIssueDraft {
+                parent_id: None,
+                title: "Top level".into(),
+                description: String::new(),
+                issue_type: "task".into(),
+                priority: 1,
+            })
+            .unwrap();
+
+        assert_eq!(issue_id, "root-1");
+        let recorded = fs::read_to_string(&arguments).unwrap();
+        assert!(!recorded.lines().any(|argument| argument == "--parent"));
+        assert!(recorded.lines().any(|argument| argument == "--silent"));
+
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_file(arguments);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_status_and_priority_run_bd_update() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir();
+        let script = directory.join(format!("be-fake-bd-update-{}-{nonce}", std::process::id()));
+        let arguments = directory.join(format!(
+            "be-fake-bd-update-args-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let bd = Bd::new(script.clone().into_os_string(), None);
+        bd.set_status("task-1", "in_progress").unwrap();
+        bd.set_priority("task-1", 2).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&arguments)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![
+                "update",
+                "task-1",
+                "--status",
+                "in_progress",
+                "update",
+                "task-1",
+                "--priority",
+                "P2",
             ]
         );
 

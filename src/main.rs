@@ -28,9 +28,11 @@ Options:
   -h, --help        Print help
   -V, --version     Print version
 
-Tree:      + add child · j/k move · h/l fold · Tab toggle · Enter open · e edit description · x close · q/Esc quit
-Task view: + add child · j/k dependency · Enter open · e edit description · Backspace back · Esc tree
-           et edit title · x close issue (with confirmation)
+Tree:      j/k move · h/l fold · Tab toggle · Enter open (creates on the + Create New entry)
+           / go to · q/Esc quit
+Task view: j/k dependency · Enter open · Backspace back · Esc tree · q quit
+Both:      e edit description · et edit title · s set status · p set priority
+           + add child · x close issue (with confirmation)
 
 Add issue: Enter advances · j/k selects type/priority · e opens $EDITOR for text
            Backspace returns to the previous selection · Esc asks before discarding
@@ -220,6 +222,21 @@ fn next_action(app: &mut App, close_pending: bool) -> io::Result<Action> {
     }
 }
 
+/// Applies a finished `bd update`, reloading the whole graph on success since
+/// a status change can move an issue in or out of the tree.
+fn apply_update(app: &mut App, bd: &Bd, result: io::Result<()>, success: String) {
+    match result {
+        Ok(()) => match bd.load() {
+            Ok(graph) => {
+                app.refresh_graph(graph);
+                app.set_status(success);
+            }
+            Err(error) => app.set_status(format!("{error} · view may be stale")),
+        },
+        Err(error) => app.set_status(error.to_string()),
+    }
+}
+
 fn run(bd: Bd) -> io::Result<()> {
     let mut app = App::new(bd.load()?);
 
@@ -245,6 +262,8 @@ fn run(bd: Bd) -> io::Result<()> {
             | Action::Edit(_)
             | Action::EditAddIssue(_)
             | Action::CreateIssue(_)
+            | Action::SetStatus(..)
+            | Action::SetPriority(..)
                 if pending_close.is_some() =>
             {
                 app.set_status("waiting for the previous close to finish".to_string());
@@ -258,8 +277,7 @@ fn run(bd: Bd) -> io::Result<()> {
                 pending_close = Some(PendingClose::spawn(&bd, issue_id, rollback));
             }
             Action::Edit(field) => {
-                let Some(issue_id) = app.current_detail_issue().map(|issue| issue.id.clone())
-                else {
+                let Some(issue_id) = app.current_issue().map(|issue| issue.id.clone()) else {
                     continue;
                 };
                 guard.restore(&mut out)?;
@@ -285,10 +303,14 @@ fn run(bd: Bd) -> io::Result<()> {
             Action::CreateIssue(draft) => match bd.create_issue(&draft) {
                 Ok(issue_id) => {
                     app.finish_add_issue();
+                    let created = match &draft.parent_id {
+                        Some(parent_id) => format!("Created {issue_id} under {parent_id}"),
+                        None => format!("Created {issue_id}"),
+                    };
                     match bd.load() {
                         Ok(graph) => {
                             app.refresh_graph(graph);
-                            app.set_status(format!("Created {issue_id} under {}", draft.parent_id));
+                            app.set_status(created);
                         }
                         Err(error) => app.set_status(format!(
                             "Created {issue_id}, but reload failed: {error} · view may be stale"
@@ -297,6 +319,19 @@ fn run(bd: Bd) -> io::Result<()> {
                 }
                 Err(error) => app.set_status(error.to_string()),
             },
+            Action::SetStatus(issue_id, status) => {
+                let result = bd.set_status(&issue_id, status);
+                apply_update(&mut app, &bd, result, format!("Set {issue_id} to {status}"));
+            }
+            Action::SetPriority(issue_id, priority) => {
+                let result = bd.set_priority(&issue_id, priority);
+                apply_update(
+                    &mut app,
+                    &bd,
+                    result,
+                    format!("Set {issue_id} to P{priority}"),
+                );
+            }
             Action::None => {}
         }
     }
