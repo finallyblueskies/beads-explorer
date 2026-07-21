@@ -1,4 +1,4 @@
-use crate::app::{AddIssueStep, App, Screen, ISSUE_TYPES, PRIORITIES};
+use crate::app::{AddIssueFlow, AddIssueStep, App, Screen, ISSUE_TYPES, PRIORITIES};
 use crate::model::Issue;
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
@@ -27,6 +27,12 @@ struct DetailLine {
     text: String,
     style: LineStyle,
     dependency: Option<usize>,
+}
+
+/// Issue behind a table row, for cell colors; `None` renders the header.
+struct RowState<'a> {
+    selected: bool,
+    issue: &'a Issue,
 }
 
 pub fn draw(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
@@ -66,7 +72,6 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         0,
         &["ID", "PRIORITY", "STATUS", "TYPE", "NAME"],
         widths,
-        true,
         None,
     )?;
 
@@ -132,13 +137,10 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
                 line as u16 + 1,
                 &[&issue.id, &priority, &issue.status, &issue_type, &name],
                 widths,
-                false,
-                Some((
-                    position == app.cursor,
-                    issue.priority,
-                    issue.status.as_str(),
-                    issue.issue_type.as_str(),
-                )),
+                Some(RowState {
+                    selected: position == app.cursor,
+                    issue,
+                }),
             )?;
         }
         content_end = visible as u16 + 1;
@@ -283,81 +285,24 @@ fn draw_close_confirmation(
     height: u16,
     issue_id: &str,
 ) -> io::Result<()> {
-    if width == 0 || height == 0 {
-        return Ok(());
-    }
-
-    let title = " Confirm close ";
-    let message = format!("Close issue {issue_id}?");
-    let actions = "[y] Yes    [n/Esc] No";
-    if width < 4 || height < 3 {
-        let prompt = format!("{message} y/n");
-        queue!(
-            out,
-            MoveTo(0, height - 1),
-            SetForegroundColor(Color::Yellow),
-            SetAttribute(Attribute::Bold),
-            Print(truncate(&prompt, width as usize)),
-            ResetColor,
-            SetAttribute(Attribute::Reset)
-        )?;
-        return Ok(());
-    }
-
-    let desired_width = message
-        .width()
-        .max(actions.width())
-        .max(title.width())
-        .saturating_add(4);
-    let modal_width = desired_width.min(width as usize).max(4);
-    let body_lines: Vec<&str> = if height >= 5 {
-        vec![message.as_str(), "", actions]
-    } else if height == 4 {
-        vec![message.as_str(), actions]
-    } else {
-        vec![message.as_str()]
-    };
-    let modal_height = body_lines.len() + 2;
-    let left = (width as usize - modal_width) / 2;
-    let top = (height as usize - modal_height) / 2;
-    let inner_width = modal_width - 2;
-
-    let top_border = if title.width() <= inner_width {
-        format!(
-            "╭{title}{}╮",
-            "─".repeat(inner_width.saturating_sub(title.width()))
-        )
-    } else {
-        format!("╭{}╮", "─".repeat(inner_width))
-    };
-    draw_modal_line(out, left, top, &top_border, modal_width, true)?;
-    for (index, line) in body_lines.iter().enumerate() {
-        let content_width = inner_width.saturating_sub(2);
-        let content = truncate(line, content_width);
-        let body = format!(
-            "│ {}{} │",
-            content,
-            " ".repeat(content_width.saturating_sub(content.width()))
-        );
-        draw_modal_line(out, left, top + index + 1, &body, modal_width, false)?;
-    }
-    let bottom_border = format!("╰{}╯", "─".repeat(inner_width));
-    draw_modal_line(
+    draw_floating_modal(
         out,
-        left,
-        top + modal_height - 1,
-        &bottom_border,
-        modal_width,
-        true,
-    )?;
-    Ok(())
+        width,
+        height,
+        " Confirm close ",
+        &[
+            format!("Close issue {issue_id}?"),
+            String::new(),
+            "[y] Yes    [n/Esc] No".to_string(),
+        ],
+    )
 }
 
 fn draw_add_issue(
     out: &mut impl Write,
     width: u16,
     height: u16,
-    flow: &crate::app::AddIssueFlow,
+    flow: &AddIssueFlow,
     status: Option<&str>,
 ) -> io::Result<()> {
     let mut lines = vec![format!("Parent: {}", flow.parent_id), String::new()];
@@ -648,8 +593,7 @@ fn write_table_row(
     y: u16,
     cells: &[&str; 5],
     widths: [usize; 5],
-    header: bool,
-    state: Option<(bool, i32, &str, &str)>,
+    state: Option<RowState>,
 ) -> io::Result<()> {
     queue!(
         out,
@@ -658,7 +602,8 @@ fn write_table_row(
         ResetColor,
         SetAttribute(Attribute::Reset)
     )?;
-    let selected = state.is_some_and(|state| state.0);
+    let header = state.is_none();
+    let selected = state.as_ref().is_some_and(|state| state.selected);
     let highlighted = header || selected;
     if highlighted {
         queue!(out, SetBackgroundColor(HIGHLIGHT_BACKGROUND))?;
@@ -668,16 +613,15 @@ fn write_table_row(
     }
 
     for index in 0..5 {
-        if !header {
-            if index == 1 {
-                let priority = state.map(|state| state.1).unwrap_or(4);
-                queue!(out, SetForegroundColor(priority_color(priority)))?;
-            } else if index == 2 {
-                let status = state.map(|state| state.2).unwrap_or("");
-                queue!(out, SetForegroundColor(status_color(status)))?;
-            } else if index == 3 {
-                let issue_type = state.map(|state| state.3).unwrap_or("");
-                queue!(out, SetForegroundColor(type_color(issue_type)))?;
+        if let Some(state) = &state {
+            match index {
+                1 => queue!(
+                    out,
+                    SetForegroundColor(priority_color(state.issue.priority))
+                )?,
+                2 => queue!(out, SetForegroundColor(status_color(&state.issue.status)))?,
+                3 => queue!(out, SetForegroundColor(type_color(&state.issue.issue_type)))?,
+                _ => {}
             }
         }
         queue!(out, Print(pad(cells[index], widths[index])))?;
@@ -989,14 +933,22 @@ mod tests {
         let mut issue_type = Vec::new();
         queue!(issue_type, SetForegroundColor(type_color("feature"))).unwrap();
 
+        let issue = Issue {
+            priority: 0,
+            status: "open".into(),
+            issue_type: "feature".into(),
+            ..Issue::default()
+        };
         let mut selected = Vec::new();
         write_table_row(
             &mut selected,
             1,
             &["issue-1", "P0", "open", "feat", "Example"],
             [8, 8, 8, 4, 12],
-            false,
-            Some((true, 0, "open", "feature")),
+            Some(RowState {
+                selected: true,
+                issue: &issue,
+            }),
         )
         .unwrap();
         let mut header = Vec::new();
@@ -1005,7 +957,6 @@ mod tests {
             0,
             &["ID", "PRIORITY", "STATUS", "TYPE", "NAME"],
             [8, 8, 8, 4, 12],
-            true,
             None,
         )
         .unwrap();

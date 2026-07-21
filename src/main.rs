@@ -1,5 +1,6 @@
 use beads_explorer::app::{Action, App};
-use beads_explorer::{model, ui};
+use beads_explorer::model::{Bd, IssueGraph};
+use beads_explorer::ui;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
@@ -35,13 +36,8 @@ Add issue: Enter advances · j/k selects type/priority · e opens $EDITOR for te
            Backspace returns to the previous selection · Esc asks before discarding
 ";
 
-struct Options {
-    bd: OsString,
-    db: Option<PathBuf>,
-}
-
 enum CloseOutcome {
-    Reloaded(model::IssueGraph),
+    Reloaded(IssueGraph),
     CloseFailed(io::Error),
     ReloadFailed(io::Error),
 }
@@ -50,7 +46,51 @@ enum CloseOutcome {
 /// pre-close graph if `bd` rejects the close after the optimistic update.
 struct PendingClose {
     outcome: mpsc::Receiver<CloseOutcome>,
-    rollback: model::IssueGraph,
+    rollback: IssueGraph,
+}
+
+impl PendingClose {
+    fn spawn(bd: &Bd, issue_id: String, rollback: IssueGraph) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let bd = bd.clone();
+        thread::spawn(move || {
+            let outcome = match bd.close_issue(&issue_id) {
+                Err(error) => CloseOutcome::CloseFailed(error),
+                Ok(()) => match bd.load() {
+                    Ok(graph) => CloseOutcome::Reloaded(graph),
+                    Err(error) => CloseOutcome::ReloadFailed(error),
+                },
+            };
+            let _ = sender.send(outcome);
+        });
+        Self {
+            outcome: receiver,
+            rollback,
+        }
+    }
+
+    /// Applies a finished close to `app`; returns itself while still running.
+    fn poll(self, app: &mut App) -> Option<Self> {
+        match self.outcome.try_recv() {
+            Ok(CloseOutcome::Reloaded(graph)) => {
+                app.refresh_graph(graph);
+                app.clear_status();
+            }
+            Ok(CloseOutcome::CloseFailed(error)) => {
+                app.refresh_graph(self.rollback);
+                app.set_status(error.to_string());
+            }
+            Ok(CloseOutcome::ReloadFailed(error)) => {
+                app.set_status(format!("{error} · view may be stale"));
+            }
+            Err(mpsc::TryRecvError::Empty) => return Some(self),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                app.refresh_graph(self.rollback);
+                app.set_status("close failed: background worker died".to_string());
+            }
+        }
+        None
+    }
 }
 
 struct TerminalGuard {
@@ -91,7 +131,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn parse_args() -> Result<Option<Options>, String> {
+fn parse_args() -> Result<Option<Bd>, String> {
     let mut args = env::args_os().skip(1);
     let mut bd = env::var_os("BEADS_EXPLORER_BD").unwrap_or_else(|| OsString::from("bd"));
     let mut db = None;
@@ -119,7 +159,7 @@ fn parse_args() -> Result<Option<Options>, String> {
             unknown => return Err(format!("unknown option: {unknown}\n\n{HELP}")),
         }
     }
-    Ok(Some(Options { bd, db }))
+    Ok(Some(Bd::new(bd, db)))
 }
 
 fn edit_add_issue_field(initial: &str) -> io::Result<String> {
@@ -147,80 +187,62 @@ fn edit_add_issue_field(initial: &str) -> io::Result<String> {
     result
 }
 
-fn run(options: Options) -> io::Result<()> {
-    let graph = model::load(&options.bd, options.db.as_deref())?;
-    let mut app = App::new(graph);
+fn read_key_action(app: &mut App) -> io::Result<Action> {
+    Ok(match event::read()? {
+        Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+        _ => Action::None,
+    })
+}
+
+/// Blocks for the next key unless a pending `e` chord or background close
+/// needs the loop to wake up on a timeout.
+fn next_action(app: &mut App, close_pending: bool) -> io::Result<Action> {
+    let key_timeout = app.pending_key_timeout();
+    let timeout = if close_pending {
+        Some(key_timeout.map_or(CLOSE_POLL_INTERVAL, |timeout| {
+            timeout.min(CLOSE_POLL_INTERVAL)
+        }))
+    } else {
+        key_timeout
+    };
+    let Some(timeout) = timeout else {
+        return read_key_action(app);
+    };
+    if event::poll(timeout)? {
+        read_key_action(app)
+    } else if app
+        .pending_key_timeout()
+        .is_some_and(|remaining| remaining.is_zero())
+    {
+        Ok(app.flush_pending_key())
+    } else {
+        Ok(Action::None)
+    }
+}
+
+fn run(bd: Bd) -> io::Result<()> {
+    let mut app = App::new(bd.load()?);
 
     let output: Box<dyn Write> = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
         Ok(tty) => Box::new(tty),
         Err(_) => Box::new(io::stdout()),
     };
     let mut out = BufWriter::new(output);
-    terminal::enable_raw_mode()?;
-    let mut guard = TerminalGuard { active: true };
-    execute!(out, EnterAlternateScreen, Hide)?;
+    let mut guard = TerminalGuard { active: false };
+    guard.activate(&mut out)?;
 
     let mut pending_close: Option<PendingClose> = None;
 
     loop {
-        if let Some(pending) = pending_close.take() {
-            match pending.outcome.try_recv() {
-                Ok(CloseOutcome::Reloaded(graph)) => {
-                    app.refresh_graph(graph);
-                    app.clear_status();
-                }
-                Ok(CloseOutcome::CloseFailed(error)) => {
-                    app.refresh_graph(pending.rollback);
-                    app.set_status(error.to_string());
-                }
-                Ok(CloseOutcome::ReloadFailed(error)) => {
-                    app.set_status(format!("{error} · view may be stale"));
-                }
-                Err(mpsc::TryRecvError::Empty) => pending_close = Some(pending),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    app.refresh_graph(pending.rollback);
-                    app.set_status("close failed: background worker died".to_string());
-                }
-            }
-        }
+        pending_close = pending_close.and_then(|pending| pending.poll(&mut app));
 
         let (width, height) = terminal::size()?;
         ui::draw(&mut app, &mut out, width, height)?;
 
-        let key_timeout = app.pending_key_timeout();
-        let poll_timeout = if pending_close.is_some() {
-            Some(key_timeout.map_or(CLOSE_POLL_INTERVAL, |timeout| {
-                timeout.min(CLOSE_POLL_INTERVAL)
-            }))
-        } else {
-            key_timeout
-        };
-        let action = if let Some(timeout) = poll_timeout {
-            if event::poll(timeout)? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
-                    _ => Action::None,
-                }
-            } else if app
-                .pending_key_timeout()
-                .is_some_and(|remaining| remaining.is_zero())
-            {
-                app.flush_pending_key()
-            } else {
-                Action::None
-            }
-        } else {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
-                _ => Action::None,
-            }
-        };
-
-        match action {
+        match next_action(&mut app, pending_close.is_some())? {
             Action::Quit => break,
             Action::CloseIssue(_)
-            | Action::EditDescription
-            | Action::EditTitle
+            | Action::Edit(_)
             | Action::EditAddIssue(_)
             | Action::CreateIssue(_)
                 if pending_close.is_some() =>
@@ -233,41 +255,17 @@ fn run(options: Options) -> io::Result<()> {
                 app.return_to_tree();
                 app.refresh_graph(optimistic);
                 app.set_status(format!("Closing {issue_id}…"));
-
-                let (sender, receiver) = mpsc::channel();
-                let bd = options.bd.clone();
-                let db = options.db.clone();
-                thread::spawn(move || {
-                    let outcome = match model::close_issue(&bd, db.as_deref(), &issue_id) {
-                        Err(error) => CloseOutcome::CloseFailed(error),
-                        Ok(()) => match model::load(&bd, db.as_deref()) {
-                            Ok(graph) => CloseOutcome::Reloaded(graph),
-                            Err(error) => CloseOutcome::ReloadFailed(error),
-                        },
-                    };
-                    let _ = sender.send(outcome);
-                });
-                pending_close = Some(PendingClose {
-                    outcome: receiver,
-                    rollback,
-                });
+                pending_close = Some(PendingClose::spawn(&bd, issue_id, rollback));
             }
-            action @ (Action::EditDescription | Action::EditTitle) => {
+            Action::Edit(field) => {
                 let Some(issue_id) = app.current_detail_issue().map(|issue| issue.id.clone())
                 else {
                     continue;
                 };
                 guard.restore(&mut out)?;
-                let edit_result = match action {
-                    Action::EditDescription => {
-                        model::edit_description(&options.bd, options.db.as_deref(), &issue_id)
-                    }
-                    Action::EditTitle => {
-                        model::edit_title(&options.bd, options.db.as_deref(), &issue_id)
-                    }
-                    _ => unreachable!(),
-                }
-                .and_then(|_| model::load_issue(&options.bd, options.db.as_deref(), &issue_id));
+                let edit_result = bd
+                    .edit(field, &issue_id)
+                    .and_then(|_| bd.load_issue(&issue_id));
                 guard.activate(&mut out)?;
                 match edit_result {
                     Ok(issue) => app.graph.replace_issue(issue),
@@ -284,18 +282,10 @@ fn run(options: Options) -> io::Result<()> {
                     Err(error) => app.set_status(error.to_string()),
                 }
             }
-            Action::CreateIssue(draft) => match model::create_issue(
-                &options.bd,
-                options.db.as_deref(),
-                &draft.parent_id,
-                &draft.title,
-                &draft.description,
-                &draft.issue_type,
-                draft.priority,
-            ) {
+            Action::CreateIssue(draft) => match bd.create_issue(&draft) {
                 Ok(issue_id) => {
                     app.finish_add_issue();
-                    match model::load(&options.bd, options.db.as_deref()) {
+                    match bd.load() {
                         Ok(graph) => {
                             app.refresh_graph(graph);
                             app.set_status(format!("Created {issue_id} under {}", draft.parent_id));
@@ -315,8 +305,8 @@ fn run(options: Options) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    let options = match parse_args() {
-        Ok(Some(options)) => options,
+    let bd = match parse_args() {
+        Ok(Some(bd)) => bd,
         Ok(None) => return ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("be: {message}");
@@ -324,7 +314,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(options) {
+    match run(bd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("be: {error}");

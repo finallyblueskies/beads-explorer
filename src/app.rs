@@ -1,4 +1,4 @@
-use crate::model::{Dependency, Issue, IssueGraph};
+use crate::model::{AddIssueDraft, Dependency, EditField, Issue, IssueGraph};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -55,15 +55,6 @@ pub enum AddIssueField {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AddIssueDraft {
-    pub parent_id: String,
-    pub title: String,
-    pub description: String,
-    pub issue_type: String,
-    pub priority: i32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddIssueFlow {
     pub parent_id: String,
     pub title: String,
@@ -103,10 +94,21 @@ pub enum Action {
     None,
     Quit,
     CloseIssue(String),
-    EditDescription,
-    EditTitle,
+    Edit(EditField),
     EditAddIssue(AddIssueField),
     CreateIssue(AddIssueDraft),
+}
+
+/// The mutually exclusive input modes layered over the tree/detail screens.
+enum Mode {
+    Normal,
+    Search {
+        query: String,
+        origin_cursor: usize,
+        origin_scroll: usize,
+    },
+    ConfirmClose(String),
+    AddIssue(AddIssueFlow),
 }
 
 pub struct App {
@@ -115,14 +117,10 @@ pub struct App {
     pub cursor: usize,
     pub scroll: usize,
     pub viewport: usize,
-    search_query: Option<String>,
-    search_origin_cursor: usize,
-    search_origin_scroll: usize,
+    mode: Mode,
     tree_rows: Vec<TreeRow>,
     expanded: HashSet<Vec<String>>,
     history: Vec<DetailFrame>,
-    confirming_close: Option<String>,
-    add_issue: Option<AddIssueFlow>,
     edit_key_started: Option<Instant>,
     status_message: Option<String>,
 }
@@ -135,14 +133,10 @@ impl App {
             cursor: 0,
             scroll: 0,
             viewport: 1,
-            search_query: None,
-            search_origin_cursor: 0,
-            search_origin_scroll: 0,
+            mode: Mode::Normal,
             tree_rows: Vec::new(),
             expanded: HashSet::new(),
             history: Vec::new(),
-            confirming_close: None,
-            add_issue: None,
             edit_key_started: None,
             status_message: None,
         };
@@ -165,7 +159,10 @@ impl App {
     }
 
     pub fn search_query(&self) -> Option<&str> {
-        self.search_query.as_deref()
+        match &self.mode {
+            Mode::Search { query, .. } => Some(query),
+            _ => None,
+        }
     }
 
     pub fn current_detail_issue(&self) -> Option<&Issue> {
@@ -183,19 +180,25 @@ impl App {
     }
 
     pub fn is_confirming_close(&self) -> bool {
-        self.confirming_close.is_some()
+        matches!(self.mode, Mode::ConfirmClose(_))
     }
 
     pub fn closing_issue_id(&self) -> Option<&str> {
-        self.confirming_close.as_deref()
+        match &self.mode {
+            Mode::ConfirmClose(issue_id) => Some(issue_id),
+            _ => None,
+        }
     }
 
     pub fn add_issue_flow(&self) -> Option<&AddIssueFlow> {
-        self.add_issue.as_ref()
+        match &self.mode {
+            Mode::AddIssue(flow) => Some(flow),
+            _ => None,
+        }
     }
 
     pub fn set_add_issue_field(&mut self, field: AddIssueField, value: String) {
-        let Some(flow) = self.add_issue.as_mut() else {
+        let Mode::AddIssue(flow) = &mut self.mode else {
             return;
         };
         match field {
@@ -212,14 +215,14 @@ impl App {
     }
 
     pub fn add_issue_field(&self, field: AddIssueField) -> Option<&str> {
-        self.add_issue.as_ref().map(|flow| match field {
+        self.add_issue_flow().map(|flow| match field {
             AddIssueField::Title => flow.title.as_str(),
             AddIssueField::Description => flow.description.as_str(),
         })
     }
 
     pub fn finish_add_issue(&mut self) {
-        self.add_issue = None;
+        self.mode = Mode::Normal;
     }
 
     pub fn status_message(&self) -> Option<&str> {
@@ -250,29 +253,36 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         self.status_message = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.confirming_close = None;
-            self.add_issue = None;
+            self.mode = Mode::Normal;
             self.edit_key_started = None;
             return Action::Quit;
         }
-        if self.add_issue.is_some() {
-            return self.handle_add_issue_key(key);
+        match self.mode {
+            Mode::AddIssue(_) => self.handle_add_issue_key(key),
+            Mode::ConfirmClose(_) => self.handle_confirm_close_key(key),
+            Mode::Search { .. } => self.handle_search_key(key),
+            Mode::Normal => match self.screen() {
+                Screen::Tree => self.handle_tree_key(key),
+                Screen::Detail => self.handle_detail_key(key),
+            },
         }
-        if self.confirming_close.is_some() {
-            return match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    Action::CloseIssue(self.confirming_close.take().unwrap())
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.confirming_close = None;
-                    Action::None
-                }
-                _ => Action::None,
-            };
-        }
-        match self.screen() {
-            Screen::Tree => self.handle_tree_key(key),
-            Screen::Detail => self.handle_detail_key(key),
+    }
+
+    fn handle_confirm_close_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::ConfirmClose(issue_id) = &self.mode else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                let issue_id = issue_id.clone();
+                self.mode = Mode::Normal;
+                Action::CloseIssue(issue_id)
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                Action::None
+            }
+            _ => Action::None,
         }
     }
 
@@ -283,17 +293,13 @@ impl App {
 
     pub fn flush_pending_key(&mut self) -> Action {
         if self.edit_key_started.take().is_some() {
-            Action::EditDescription
+            Action::Edit(EditField::Description)
         } else {
             Action::None
         }
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) -> Action {
-        if self.search_query.is_some() {
-            return self.handle_search_key(key);
-        }
-
         if key.code == KeyCode::Char('/') {
             self.start_search();
             return Action::None;
@@ -322,7 +328,7 @@ impl App {
             KeyCode::Enter => self.open_selected_issue(),
             KeyCode::Char('e') => {
                 self.open_selected_issue();
-                return Action::EditDescription;
+                return Action::Edit(EditField::Description);
             }
             KeyCode::Char('x') => self.start_close_confirmation(),
             KeyCode::Char('+') => self.start_add_issue(),
@@ -339,7 +345,7 @@ impl App {
             KeyCode::Enter => self.open_search_result(),
             KeyCode::Char('d') if ctrl => self.move_cursor(self.viewport as isize / 2),
             KeyCode::Char('u') if ctrl => {
-                if let Some(query) = self.search_query.as_mut() {
+                if let Mode::Search { query, .. } = &mut self.mode {
                     query.clear();
                 }
                 self.rebuild_search_rows();
@@ -351,7 +357,7 @@ impl App {
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.rows.len().saturating_sub(1),
             KeyCode::Backspace => {
-                if let Some(query) = self.search_query.as_mut() {
+                if let Mode::Search { query, .. } = &mut self.mode {
                     query.pop();
                 }
                 self.rebuild_search_rows();
@@ -361,7 +367,7 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Some(query) = self.search_query.as_mut() {
+                if let Mode::Search { query, .. } = &mut self.mode {
                     query.push(character);
                 }
                 self.rebuild_search_rows();
@@ -377,13 +383,13 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
             if started.elapsed() >= EDIT_SEQUENCE_TIMEOUT {
-                return Action::EditDescription;
+                return Action::Edit(EditField::Description);
             }
             if plain && key.code == KeyCode::Char('t') {
-                return Action::EditTitle;
+                return Action::Edit(EditField::Title);
             }
             if plain && key.code == KeyCode::Char('e') {
-                return Action::EditDescription;
+                return Action::Edit(EditField::Description);
             }
             // Any other key cancels the sequence and is handled normally below.
         }
@@ -424,22 +430,17 @@ impl App {
     }
 
     fn handle_add_issue_key(&mut self, key: KeyEvent) -> Action {
-        let Some(flow) = self.add_issue.as_mut() else {
+        let Mode::AddIssue(flow) = &mut self.mode else {
             return Action::None;
         };
 
         if flow.confirming_cancel {
-            return match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.add_issue = None;
-                    Action::None
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    flow.confirming_cancel = false;
-                    Action::None
-                }
-                _ => Action::None,
-            };
+            match key.code {
+                KeyCode::Char('y' | 'Y') => self.mode = Mode::Normal,
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => flow.confirming_cancel = false,
+                _ => {}
+            }
+            return Action::None;
         }
 
         if key.code == KeyCode::Esc {
@@ -542,7 +543,9 @@ impl App {
         }
         .filter(|issue| self.graph.is_listed(&issue.id))
         .map(|issue| issue.id.clone());
-        self.confirming_close = issue_id;
+        if let Some(issue_id) = issue_id {
+            self.mode = Mode::ConfirmClose(issue_id);
+        }
     }
 
     fn start_add_issue(&mut self) {
@@ -553,7 +556,7 @@ impl App {
         .map(|issue| issue.id.clone());
         if let Some(parent_id) = parent_id {
             self.edit_key_started = None;
-            self.add_issue = Some(AddIssueFlow {
+            self.mode = Mode::AddIssue(AddIssueFlow {
                 parent_id,
                 title: String::new(),
                 description: String::new(),
@@ -567,35 +570,36 @@ impl App {
 
     pub fn return_to_tree(&mut self) {
         self.history.clear();
-        self.confirming_close = None;
-        self.add_issue = None;
+        self.mode = Mode::Normal;
         self.edit_key_started = None;
     }
 
     /// Replace data loaded from `bd` without resetting the user's place in the tree.
     /// Exact paths win; issue IDs are the fallback when dependency changes move a branch.
     pub fn refresh_graph(&mut self, graph: IssueGraph) {
-        let (selected_path, selected_issue_id, old_cursor, old_scroll) =
-            if self.search_query.is_some() {
-                let cursor = self
-                    .search_origin_cursor
-                    .min(self.tree_rows.len().saturating_sub(1));
-                let row = self.tree_rows.get(cursor);
-                (
-                    row.map(|row| row.path.clone()),
-                    row.map(|row| row.issue_id.clone()),
-                    cursor,
-                    self.search_origin_scroll,
-                )
-            } else {
-                let row = self.rows.get(self.cursor);
-                (
-                    row.map(|row| row.path.clone()),
-                    row.map(|row| row.issue_id.clone()),
-                    self.cursor,
-                    self.scroll,
-                )
-            };
+        let (selected_path, selected_issue_id, old_cursor, old_scroll) = if let Mode::Search {
+            origin_cursor,
+            origin_scroll,
+            ..
+        } = self.mode
+        {
+            let cursor = origin_cursor.min(self.tree_rows.len().saturating_sub(1));
+            let row = self.tree_rows.get(cursor);
+            (
+                row.map(|row| row.path.clone()),
+                row.map(|row| row.issue_id.clone()),
+                cursor,
+                origin_scroll,
+            )
+        } else {
+            let row = self.rows.get(self.cursor);
+            (
+                row.map(|row| row.path.clone()),
+                row.map(|row| row.issue_id.clone()),
+                self.cursor,
+                self.scroll,
+            )
+        };
         let viewport_offset = old_cursor.saturating_sub(old_scroll);
         let moved_expanded_issue_ids: HashSet<String> = self
             .expanded
@@ -605,8 +609,11 @@ impl App {
             .collect();
 
         self.graph = graph;
-        self.search_query = None;
-        self.confirming_close = None;
+        // Keep an in-flight add-issue draft; search and close confirmation are
+        // transient and rebuilt against stale rows, so they end here.
+        if !matches!(self.mode, Mode::AddIssue(_)) {
+            self.mode = Mode::Normal;
+        }
         self.edit_key_started = None;
 
         // Paths that left the tree must not linger: a later refresh could
@@ -663,19 +670,26 @@ impl App {
     }
 
     fn start_search(&mut self) {
-        self.search_origin_cursor = self.cursor;
-        self.search_origin_scroll = self.scroll;
-        self.search_query = Some(String::new());
+        self.mode = Mode::Search {
+            query: String::new(),
+            origin_cursor: self.cursor,
+            origin_scroll: self.scroll,
+        };
         self.rebuild_search_rows();
     }
 
     fn cancel_search(&mut self) {
-        self.search_query = None;
+        let Mode::Search {
+            origin_cursor,
+            origin_scroll,
+            ..
+        } = std::mem::replace(&mut self.mode, Mode::Normal)
+        else {
+            return;
+        };
         self.rows.clone_from(&self.tree_rows);
-        self.cursor = self
-            .search_origin_cursor
-            .min(self.rows.len().saturating_sub(1));
-        self.scroll = self.search_origin_scroll;
+        self.cursor = origin_cursor.min(self.rows.len().saturating_sub(1));
+        self.scroll = origin_scroll;
     }
 
     fn open_search_result(&mut self) {
@@ -691,7 +705,7 @@ impl App {
     }
 
     fn rebuild_search_rows(&mut self) {
-        let Some(query) = self.search_query.as_deref() else {
+        let Mode::Search { query, .. } = &self.mode else {
             return;
         };
         self.rows = self
@@ -1059,7 +1073,10 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
-        assert_eq!(app.flush_pending_key(), Action::EditDescription);
+        assert_eq!(
+            app.flush_pending_key(),
+            Action::Edit(EditField::Description)
+        );
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
     }
 
@@ -1069,7 +1086,7 @@ mod tests {
 
         assert_eq!(
             app.handle_key(key(KeyCode::Char('e'))),
-            Action::EditDescription
+            Action::Edit(EditField::Description)
         );
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
         assert_eq!(app.screen(), Screen::Detail);
@@ -1081,7 +1098,10 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
-        assert_eq!(app.handle_key(key(KeyCode::Char('t'))), Action::EditTitle);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('t'))),
+            Action::Edit(EditField::Title)
+        );
         assert_eq!(app.current_detail_issue().unwrap().id, "a");
     }
 
@@ -1103,7 +1123,7 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Char('e'))), Action::None);
         assert_eq!(
             app.handle_key(key(KeyCode::Char('e'))),
-            Action::EditDescription
+            Action::Edit(EditField::Description)
         );
     }
 

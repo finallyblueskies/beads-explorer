@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io;
-use std::path::Path;
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Command, Output};
 
 // `bd show` hydrates dependencies into issue summaries (`id`, `title`, ...),
 // while `bd list` emits raw edge records (`depends_on_id`, `type`, ...). The
@@ -42,6 +42,22 @@ pub struct Issue {
     pub updated_at: String,
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditField {
+    Title,
+    Description,
+}
+
+/// Everything `bd create` needs for a new child issue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddIssueDraft {
+    pub parent_id: String,
+    pub title: String,
+    pub description: String,
+    pub issue_type: String,
+    pub priority: i32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -196,63 +212,44 @@ impl IssueGraph {
     }
 }
 
-pub fn load(bd: &OsStr, db: Option<&Path>) -> io::Result<IssueGraph> {
-    // One `bd list --all` call: per-ID `bd show` resolution costs ~250ms per
-    // issue, so hydrating dependency targets from the same payload instead
-    // keeps startup at a single fast query.
-    let mut args = vec!["list", "--all", "--json"];
-    let db_string = db.map(|path| path.to_string_lossy().into_owned());
-    if let Some(path) = db_string.as_deref() {
-        args.extend(["--db", path]);
-    }
-    let issues = parse_issue_collection(run_bd_json(bd, &args)?)?;
-    let (listed, context): (Vec<Issue>, Vec<Issue>) = issues
-        .into_iter()
-        .partition(|issue| matches!(issue.status.as_str(), "open" | "in_progress"));
-    if listed.is_empty() {
-        return Ok(IssueGraph::default());
-    }
-    Ok(IssueGraph::new(listed, context))
+/// The `bd` CLI plus the `--db` selection, shared by every operation.
+#[derive(Clone, Debug)]
+pub struct Bd {
+    program: OsString,
+    db: Option<PathBuf>,
 }
 
-pub fn edit_description(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
-    edit_field(bd, db, issue_id, "--description")
-}
-
-pub fn edit_title(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
-    edit_field(bd, db, issue_id, "--title")
-}
-
-pub fn create_issue(
-    bd: &OsStr,
-    db: Option<&Path>,
-    parent_id: &str,
-    title: &str,
-    description: &str,
-    issue_type: &str,
-    priority: i32,
-) -> io::Result<String> {
-    let mut command = Command::new(bd);
-    let priority = format!("P{priority}");
-    command
-        .arg("create")
-        .arg(title)
-        .args(["--description", description])
-        .args(["--type", issue_type])
-        .args(["--priority", priority.as_str()])
-        .args(["--parent", parent_id])
-        .arg("--silent");
-    if let Some(path) = db {
-        command.arg("--db").arg(path);
+impl Bd {
+    pub fn new(program: OsString, db: Option<PathBuf>) -> Self {
+        Self { program, db }
     }
 
-    let output = command.output().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not run {}: {error}", bd.to_string_lossy()),
-        )
-    })?;
-    if !output.status.success() {
+    fn name(&self) -> String {
+        self.program.to_string_lossy().into_owned()
+    }
+
+    /// `--db` goes after `args` so subcommand positionals stay in front.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(args);
+        if let Some(path) = &self.db {
+            command.arg("--db").arg(path);
+        }
+        command
+    }
+
+    /// Runs to completion; a non-zero exit becomes an error built from stderr,
+    /// or stdout when stderr is empty.
+    fn run(&self, verb: &str, command: &mut Command) -> io::Result<Output> {
+        let output = command.output().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not run {}: {error}", self.name()),
+            )
+        })?;
+        if output.status.success() {
+            return Ok(output);
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let message = if stderr.trim().is_empty() {
@@ -260,126 +257,109 @@ pub fn create_issue(
         } else {
             stderr.trim()
         };
-        return Err(io::Error::other(if message.is_empty() {
-            format!("{} create failed: {}", bd.to_string_lossy(), output.status)
-        } else {
-            format!("{} create failed: {message}", bd.to_string_lossy())
-        }));
-    }
-
-    let issue_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if issue_id.is_empty() {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} create returned no issue ID", bd.to_string_lossy()),
-        ))
-    } else {
-        Ok(issue_id)
-    }
-}
-
-pub fn close_issue(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<()> {
-    let mut command = Command::new(bd);
-    command.args(["close", issue_id]);
-    if let Some(path) = db {
-        command.arg("--db").arg(path);
-    }
-
-    let output = command.output().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not run {}: {error}", bd.to_string_lossy()),
-        )
-    })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr);
-        let message = message.trim();
         Err(io::Error::other(if message.is_empty() {
-            format!("{} close failed: {}", bd.to_string_lossy(), output.status)
+            format!("{} {verb} failed: {}", self.name(), output.status)
         } else {
-            format!("{} close failed: {message}", bd.to_string_lossy())
+            format!("{} {verb} failed: {message}", self.name())
         }))
     }
-}
 
-fn edit_field(bd: &OsStr, db: Option<&Path>, issue_id: &str, field: &str) -> io::Result<()> {
-    let mut command = Command::new(bd);
-    command.args(["edit", issue_id, field]);
-    if let Some(path) = db {
-        command.arg("--db").arg(path);
-    }
-
-    let status = command.status().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not run {}: {error}", bd.to_string_lossy()),
-        )
-    })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "{} edit failed: {status}",
-            bd.to_string_lossy()
-        )))
-    }
-}
-
-pub fn load_issue(bd: &OsStr, db: Option<&Path>, issue_id: &str) -> io::Result<Issue> {
-    let db_string = db.map(|path| path.to_string_lossy().into_owned());
-    let mut args = vec!["show", issue_id, "--json"];
-    if let Some(path) = db_string.as_deref() {
-        args.extend(["--db", path]);
-    }
-    parse_issue_collection(run_bd_json(bd, &args)?)?
-        .into_iter()
-        .find(|issue| issue.id == issue_id)
-        .ok_or_else(|| {
+    fn run_json(&self, args: &[&str]) -> io::Result<Value> {
+        let verb = args.first().copied().unwrap_or("command");
+        let output = self.run(verb, &mut self.command(args))?;
+        serde_json::from_slice(&output.stdout).map_err(|error| {
             io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{} show returned no issue {issue_id}", bd.to_string_lossy()),
+                io::ErrorKind::InvalidData,
+                format!("{} returned invalid JSON for {verb}: {error}", self.name()),
             )
         })
-}
-
-fn run_bd_json(bd: &OsStr, args: &[&str]) -> io::Result<Value> {
-    let output = Command::new(bd).args(args).output().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not run {}: {error}", bd.to_string_lossy()),
-        )
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let message = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        return Err(io::Error::other(format!(
-            "{} {} failed: {}",
-            bd.to_string_lossy(),
-            args.first().copied().unwrap_or(""),
-            if message.is_empty() {
-                output.status.to_string()
-            } else {
-                message.to_string()
-            }
-        )));
     }
-    serde_json::from_slice(&output.stdout).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} returned invalid JSON for {}: {error}",
-                bd.to_string_lossy(),
-                args.first().copied().unwrap_or("command")
-            ),
-        )
-    })
+
+    pub fn load(&self) -> io::Result<IssueGraph> {
+        // One `bd list --all` call: per-ID `bd show` resolution costs ~250ms per
+        // issue, so hydrating dependency targets from the same payload instead
+        // keeps startup at a single fast query.
+        let issues = parse_issue_collection(self.run_json(&["list", "--all", "--json"])?)?;
+        let (listed, context): (Vec<Issue>, Vec<Issue>) = issues
+            .into_iter()
+            .partition(|issue| matches!(issue.status.as_str(), "open" | "in_progress"));
+        if listed.is_empty() {
+            return Ok(IssueGraph::default());
+        }
+        Ok(IssueGraph::new(listed, context))
+    }
+
+    pub fn load_issue(&self, issue_id: &str) -> io::Result<Issue> {
+        parse_issue_collection(self.run_json(&["show", issue_id, "--json"])?)?
+            .into_iter()
+            .find(|issue| issue.id == issue_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} show returned no issue {issue_id}", self.name()),
+                )
+            })
+    }
+
+    /// `bd edit` opens `$EDITOR` itself, so the command inherits the terminal
+    /// instead of having its output captured.
+    pub fn edit(&self, field: EditField, issue_id: &str) -> io::Result<()> {
+        let flag = match field {
+            EditField::Title => "--title",
+            EditField::Description => "--description",
+        };
+        let status = self
+            .command(&["edit", issue_id, flag])
+            .status()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("could not run {}: {error}", self.name()),
+                )
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "{} edit failed: {status}",
+                self.name()
+            )))
+        }
+    }
+
+    pub fn close_issue(&self, issue_id: &str) -> io::Result<()> {
+        self.run("close", &mut self.command(&["close", issue_id]))
+            .map(|_| ())
+    }
+
+    pub fn create_issue(&self, draft: &AddIssueDraft) -> io::Result<String> {
+        let priority = format!("P{}", draft.priority);
+        let output = self.run(
+            "create",
+            &mut self.command(&[
+                "create",
+                &draft.title,
+                "--description",
+                &draft.description,
+                "--type",
+                &draft.issue_type,
+                "--priority",
+                &priority,
+                "--parent",
+                &draft.parent_id,
+                "--silent",
+            ]),
+        )?;
+        let issue_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if issue_id.is_empty() {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} create returned no issue ID", self.name()),
+            ))
+        } else {
+            Ok(issue_id)
+        }
+    }
 }
 
 fn parse_issue_collection(value: Value) -> io::Result<Vec<Issue>> {
@@ -546,7 +526,9 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&script, permissions).unwrap();
 
-        let graph = load(script.as_os_str(), None).unwrap();
+        let graph = Bd::new(script.clone().into_os_string(), None)
+            .load()
+            .unwrap();
 
         assert!(graph.is_listed("open"));
         assert!(graph.is_listed("working"));
@@ -578,16 +560,19 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&script, permissions).unwrap();
 
-        let issue_id = create_issue(
-            script.as_os_str(),
-            Some(Path::new("/tmp/example.db")),
-            "parent-1",
-            "Child title",
-            "Body text",
-            "feature",
-            1,
-        )
-        .unwrap();
+        let bd = Bd::new(
+            script.clone().into_os_string(),
+            Some(PathBuf::from("/tmp/example.db")),
+        );
+        let issue_id = bd
+            .create_issue(&AddIssueDraft {
+                parent_id: "parent-1".into(),
+                title: "Child title".into(),
+                description: "Body text".into(),
+                issue_type: "feature".into(),
+                priority: 1,
+            })
+            .unwrap();
 
         assert_eq!(issue_id, "child-1");
         assert_eq!(
